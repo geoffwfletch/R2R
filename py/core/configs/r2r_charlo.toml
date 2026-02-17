@@ -1,0 +1,45 @@
+[app]
+# GPT-4 suite on Azure OpenAI
+quality_llm = "azure/gpt-4.1"
+fast_llm = "azure/gpt-4.1-mini"
+vlm = "azure/gpt-4.1"
+audio_lm = "azure/gpt-4.1-mini"
+reasoning_llm = "azure/gpt-4.1"
+planning_llm = "azure/gpt-4.1"
+
+# 500 MB for all file types
+default_max_upload_size = 524288000
+
+  [app.max_upload_size_by_type]
+  txt = 524288000
+  md = 524288000
+  tsv = 524288000
+  csv = 524288000
+  html = 524288000
+  doc = 524288000
+  docx = 524288000
+  ppt = 524288000
+  pptx = 524288000
+  xls = 524288000
+  xlsx = 524288000
+  odt = 524288000
+  pdf = 524288000
+  eml = 524288000
+  msg = 524288000
+  p7s = 524288000
+  bmp = 524288000
+  heic = 524288000
+  jpeg = 524288000
+  jpg = 524288000
+  png = 524288000
+  tiff = 524288000
+  epub = 524288000
+  rtf = 524288000
+  rst = 524288000
+  org = 524288000
+
+[embedding]
+base_model = "azure/text-embedding-3-small"
+
+[completion_embedding]
+base_model = "azure/text-embedding-3-small"
