@@ -2,8 +2,8 @@
 # GPT-4 suite on Azure OpenAI
 quality_llm = "azure/gpt-4.1"
 fast_llm = "azure/gpt-4.1-mini"
-vlm = "azure/gpt-4.1"
-audio_lm = "azure/gpt-4.1-mini"
+vlm = "azure/gpt-4.1-mini"
+audio_lm = "openai/whisper-1"
 reasoning_llm = "azure/gpt-4.1"
 planning_llm = "azure/gpt-4.1"
 
@@ -39,7 +39,13 @@ default_max_upload_size = 524288000
   org = 524288000
 
 [embedding]
-base_model = "azure/text-embedding-3-small"
+base_model = "azure/text-embedding-3-large"
+base_dimension = 512
 
 [completion_embedding]
-base_model = "azure/text-embedding-3-small"
+base_model = "azure/text-embedding-3-large"
+base_dimension = 512
+
+[ingestion]
+chunk_size = 1024
+chunk_overlap = 200
