@@ -25,4 +25,4 @@ dynamic_rag_agent:
     document_context: str
     max_tool_context_length: str
 
-  overwrite_on_diff: true
+  overwrite_on_diff: false
