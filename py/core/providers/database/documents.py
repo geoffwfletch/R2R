@@ -54,8 +54,13 @@ def transform_filter_fields(filters: dict[str, Any]) -> dict[str, Any]:
                 transformed[key] = transform_filter_fields(value)  # type: ignore
             continue
 
-        # Replace 'document_id' with 'id'
-        new_key = "id" if key == "document_id" else key
+        # Replace 'document_id' with 'id', 'document_type' with 'type'
+        if key == "document_id":
+            new_key = "id"
+        elif key == "document_type":
+            new_key = "type"
+        else:
+            new_key = key
 
         # Handle nested dictionary cases (e.g., for operators like $eq, $gt, etc.)
         if isinstance(value, dict):
