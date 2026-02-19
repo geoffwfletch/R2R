@@ -761,7 +761,7 @@ class PostgresDocumentsHandler(Handler):
         """Search documents using semantic similarity with their summary
         embeddings."""
 
-        where_clauses = ["summary_embedding IS NOT NULL"]
+        where_clauses = []
         params: list[str | int | bytes] = [str(query_embedding)]
 
         vector_dim = (
@@ -775,7 +775,7 @@ class PostgresDocumentsHandler(Handler):
             if filter_condition:
                 where_clauses.append(filter_condition)
 
-        where_clause = " AND ".join(where_clauses)
+        where_clause = " AND ".join(where_clauses) if where_clauses else "TRUE"
 
         query = f"""
         WITH document_scores AS (
@@ -795,7 +795,11 @@ class PostgresDocumentsHandler(Handler):
                 summary,
                 summary_embedding,
                 total_tokens,
-                (summary_embedding <=> $1::vector({vector_dim})) as semantic_distance
+                CASE
+                    WHEN summary_embedding IS NOT NULL
+                    THEN (summary_embedding <=> $1::vector({vector_dim}))
+                    ELSE 2.0
+                END as semantic_distance
             FROM {self._get_table_name(PostgresDocumentsHandler.TABLE_NAME)}
             WHERE {where_clause}
             ORDER BY semantic_distance ASC
@@ -836,11 +840,15 @@ class PostgresDocumentsHandler(Handler):
                 created_at=row["created_at"],
                 updated_at=row["updated_at"],
                 summary=row["summary"],
-                summary_embedding=[
-                    float(x)
-                    for x in row["summary_embedding"][1:-1].split(",")
-                    if x
-                ],
+                summary_embedding=(
+                    [
+                        float(x)
+                        for x in row["summary_embedding"][1:-1].split(",")
+                        if x
+                    ]
+                    if row["summary_embedding"]
+                    else None
+                ),
                 total_tokens=row["total_tokens"],
             )
             for row in results

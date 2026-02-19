@@ -166,7 +166,7 @@ class IngestionConfig(ProviderConfig):
         if mode == "ocr":
             return cls(app=app, parser_overrides={"pdf": "ocr"})
         if mode == "fast":
-            return cls(app=app, skip_document_summary=True)
+            return cls(app=app)
         else:
             return cls(app=app)
 
