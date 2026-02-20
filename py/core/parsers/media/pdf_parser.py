@@ -3,6 +3,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import string
 import time
 import unicodedata
@@ -23,6 +24,184 @@ from core.base.providers import (
 )
 
 logger = logging.getLogger()
+
+
+_ROMAN_NUMERALS = frozenset({
+    "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X",
+    "XI", "XII", "XIII", "XIV", "XV", "XVI", "XVII", "XVIII", "XIX", "XX",
+})
+
+
+def _heading_numbering_depth(text: str) -> int | None:
+    """Return numbering depth from heading text, or None if unnumbered.
+
+    "1.2.3 Heading" -> 3, "1. Heading" -> 1, "IV. Heading" -> 1
+    """
+    text = text.strip()
+
+    # Dotted numerical: 1.2.3 -> depth 3
+    m = re.match(r"^(\d+(?:\.\d+)+)\s", text)
+    if m:
+        return len(m.group(1).split("."))
+
+    # Simple numerical: 1. or 3) -> depth 1
+    if re.match(r"^\d+[.)]\s", text):
+        return 1
+
+    # Roman: IV. or III) -> depth 1
+    m = re.match(r"^([IVXLCDM]+)[.)]\s", text, re.IGNORECASE)
+    if m and m.group(1).upper() in _ROMAN_NUMERALS:
+        return 1
+
+    # Alphabetic: A. or b) -> depth 1
+    if re.match(r"^[A-Za-z][.)]\s", text):
+        return 1
+
+    return None
+
+
+def _fix_heading_levels_by_numbering(md: str) -> str:
+    """Adjust ## heading levels using numbering depth when >30% are numbered."""
+    h2_re = re.compile(r"^## (.+)$", re.MULTILINE)
+    matches = list(h2_re.finditer(md))
+    if not matches:
+        return md
+
+    depths = [_heading_numbering_depth(m.group(1)) for m in matches]
+    numbered = sum(1 for d in depths if d is not None)
+    if numbered / len(matches) <= 0.3:
+        return md
+
+    for match, depth in reversed(list(zip(matches, depths))):
+        if depth is None or depth == 2:
+            continue
+        prefix = "#" * min(depth, 3) + " "
+        if prefix == "## ":
+            continue
+        md = md[:match.start()] + prefix + match.group(1) + md[match.end():]
+
+    return md
+
+
+def _promote_empty_body_headings(md: str) -> str:
+    """Promote ## with no body before next ## to #."""
+    return re.sub(
+        r"^(## .+)\n\s*\n(?=## )",
+        lambda m: m.group(1).replace("## ", "# ", 1) + "\n\n",
+        md,
+        flags=re.MULTILINE,
+    )
+
+
+def _normalize_heading_text(text: str) -> str:
+    """Normalize heading text for fuzzy matching."""
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def _extract_heading_font_sizes(result) -> list[tuple[str, float]]:
+    """Extract ``(text, font_size)`` pairs for section headers from a
+    docling ``ConversionResult``.  Font size is approximated by the
+    first cell's bounding-box height in the layout cluster.
+    """
+    headings: list[tuple[str, float]] = []
+    for page in result.pages:
+        preds = getattr(page, "predictions", None)
+        layout = getattr(preds, "layout", None) if preds else None
+        if layout is None:
+            continue
+        for cluster in layout.clusters:
+            if cluster.label != "section_header" or not cluster.cells:
+                continue
+            text = " ".join(c.text for c in cluster.cells).strip()
+            size = cluster.cells[0].rect.height
+            if text:
+                headings.append((text, size))
+    return headings
+
+
+def _infer_levels_from_font_sizes(
+    heading_sizes: list[tuple[str, float]],
+    tolerance: float = 1.0,
+) -> dict[str, int]:
+    """Map *normalised* heading text -> level (1-3) based on font size.
+
+    Largest font cluster -> level 1, next -> level 2, etc.
+    Sizes within *tolerance* are treated as the same level.
+    Returns an empty dict when all headings share one size level
+    (i.e. font size provides no hierarchy signal).
+    """
+    if not heading_sizes:
+        return {}
+
+    unique_sizes = sorted(set(s for _, s in heading_sizes), reverse=True)
+
+    # Build clusters: each cluster is a representative (largest) size
+    cluster_reps: list[float] = []
+    for size in unique_sizes:
+        if not cluster_reps or cluster_reps[-1] - size > tolerance:
+            cluster_reps.append(size)
+
+    # Only useful when there are multiple distinct size levels
+    if len(cluster_reps) <= 1:
+        return {}
+
+    # Map every unique size to the cluster level it belongs to
+    size_to_level: dict[float, int] = {}
+    for size in unique_sizes:
+        for idx, rep in enumerate(cluster_reps):
+            if rep - size <= tolerance:
+                size_to_level[size] = min(idx + 1, 3)
+                break
+
+    return {
+        _normalize_heading_text(text): size_to_level[size]
+        for text, size in heading_sizes
+        if size in size_to_level
+    }
+
+
+def _apply_font_size_levels(md: str, level_map: dict[str, int]) -> str:
+    """Replace ``##`` headings with the level dictated by *level_map*."""
+    if not level_map:
+        return md
+
+    h2_re = re.compile(r"^## (.+)$", re.MULTILINE)
+
+    def _replace(match):
+        level = level_map.get(_normalize_heading_text(match.group(1)))
+        if level is None or level == 2:
+            return match.group(0)
+        return "#" * level + " " + match.group(1)
+
+    return h2_re.sub(_replace, md)
+
+
+def fix_heading_hierarchy(md: str) -> str:
+    """Fix flattened heading hierarchy using text heuristics only.
+
+    Two strategies applied in order:
+    1. Numbering-based: if >30% of H2s have numbering (1.2.3, IV., A.),
+       adjust levels by numbering depth.
+    2. Structural: promote empty-body H2s to H1 (parent headings).
+    """
+    md = _fix_heading_levels_by_numbering(md)
+    md = _promote_empty_body_headings(md)
+    return md
+
+
+def fix_heading_hierarchy_from_result(md: str, result) -> str:
+    """Fix heading hierarchy using font-size data from ConversionResult,
+    falling back to text heuristics when font sizes are unavailable.
+    """
+    heading_sizes = _extract_heading_font_sizes(result)
+    level_map = _infer_levels_from_font_sizes(heading_sizes)
+    if level_map:
+        md = _apply_font_size_levels(md, level_map)
+    else:
+        md = _fix_heading_levels_by_numbering(md)
+    # Always run structural pass for remaining flat headings
+    md = _promote_empty_body_headings(md)
+    return md
 
 
 class OCRPDFParser(AsyncParser[str | bytes]):
@@ -410,6 +589,112 @@ class BasicPDFParser(AsyncParser[str | bytes]):
                     )
                 )  # Keep characters in common languages ; # Filter out non-printable characters
                 yield page_text
+
+
+class DoclingHybridPDFParser(AsyncParser[str | bytes]):
+    """PDF parser using Docling extraction + HybridChunker (pre-chunked)."""
+
+    def __init__(
+        self,
+        config: IngestionConfig,
+        database_provider: DatabaseProvider,
+        llm_provider: CompletionProvider,
+    ):
+        self.config = config
+        self.database_provider = database_provider
+        self.llm_provider = llm_provider
+
+    async def ingest(
+        self, data: str | bytes, **kwargs
+    ) -> AsyncGenerator[dict, None]:
+        import os
+        import tempfile
+
+        from docling.document_converter import DocumentConverter
+        from docling_core.transforms.chunker import HybridChunker
+
+        if isinstance(data, str):
+            temp_path = data
+        else:
+            tmp = tempfile.NamedTemporaryFile(
+                delete=False, suffix=".pdf"
+            )
+            tmp.write(data)
+            tmp.flush()
+            tmp.close()
+            temp_path = tmp.name
+
+        try:
+            converter = DocumentConverter()
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, converter.convert, temp_path)
+            doc = result.document
+
+            yield {
+                "full_markdown": doc.export_to_markdown(),
+                "type": "markdown_preview",
+            }
+
+            chunker = HybridChunker()
+            for i, chunk in enumerate(chunker.chunk(doc)):
+                yield {
+                    "content": chunker.serialize(chunk),
+                    "metadata": {"chunk_order": i},
+                    "pre_chunked": True,
+                }
+        finally:
+            if not isinstance(data, str):
+                os.unlink(temp_path)
+
+
+class DoclingMarkdownPDFParser(AsyncParser[str | bytes]):
+    """PDF parser using Docling extraction → markdown (chunked by MarkdownChunker)."""
+
+    def __init__(
+        self,
+        config: IngestionConfig,
+        database_provider: DatabaseProvider,
+        llm_provider: CompletionProvider,
+    ):
+        self.config = config
+        self.database_provider = database_provider
+        self.llm_provider = llm_provider
+
+    async def ingest(
+        self, data: str | bytes, **kwargs
+    ) -> AsyncGenerator[str | dict, None]:
+        import os
+        import tempfile
+
+        from docling.document_converter import DocumentConverter
+
+        if isinstance(data, str):
+            temp_path = data
+        else:
+            tmp = tempfile.NamedTemporaryFile(
+                delete=False, suffix=".pdf"
+            )
+            tmp.write(data)
+            tmp.flush()
+            tmp.close()
+            temp_path = tmp.name
+
+        try:
+            converter = DocumentConverter()
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, converter.convert, temp_path)
+            md = result.document.export_to_markdown()
+            md = fix_heading_hierarchy_from_result(md, result)
+
+            yield {
+                "full_markdown": md,
+                "type": "markdown_preview",
+            }
+
+            yield md
+        finally:
+            if not isinstance(data, str):
+                os.unlink(temp_path)
 
 
 class PDFParserUnstructured(AsyncParser[str | bytes]):
