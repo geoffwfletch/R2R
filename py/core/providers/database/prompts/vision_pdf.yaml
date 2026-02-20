@@ -1,42 +1,29 @@
 vision_pdf:
   template: >
-    Convert this PDF page to markdown format, preserving all content and formatting. Follow these guidelines:
+    Convert this PDF page to markdown. Output ONLY the markdown content directly — no code fences, no ```markdown blocks, no metadata.
 
     Text:
-    - Maintain the original text hierarchy (headings, paragraphs, lists)
-    - Preserve any special formatting (bold, italic, underline)
-    - Include all footnotes, citations, and references
-    - Keep text in its original reading order
+    - Maintain heading hierarchy (# ## ###), paragraphs, lists
+    - Preserve bold, italic formatting
+    - Include footnotes, citations, references
+    - Keep original reading order
 
     Tables:
-    - Recreate tables using markdown table syntax
-    - Preserve all headers, rows, and columns
-    - Maintain alignment and formatting where possible
-    - Include any table captions or notes
+    - Use markdown table syntax
+    - Preserve all headers, rows, columns
+    - Include table captions if present
 
     Equations:
-    - Convert mathematical equations using LaTeX notation
-    - Preserve equation numbers if present
-    - Include any surrounding context or references
+    - Use LaTeX notation
+    - Preserve equation numbers
 
     Images:
-    - Enclose image descriptions within [FIG] and [/FIG] tags
-    - Include detailed descriptions of:
-      * Main subject matter
-      * Text overlays or captions
-      * Charts, graphs, or diagrams
-      * Relevant colors, patterns, or visual elements
-    - Maintain image placement relative to surrounding text
+    - Describe images within [FIG] and [/FIG] tags
+    - Include subject matter, text overlays, chart/graph descriptions
 
-    Additional Elements:
-    - Include page numbers if visible
-    - Preserve headers and footers
-    - Maintain sidebars or callout boxes
-    - Keep any special symbols or characters
-
-    Quality Requirements:
-    - Ensure 100% content preservation
-    - Maintain logical document flow
-    - Verify all markdown syntax is valid
-    - Double-check completeness before submitting
+    Rules:
+    - Do NOT output "Page number:", "Header/Footer:", "Sidebars/Callouts:" or any metadata about page elements
+    - Do NOT wrap output in code fences
+    - Only output the actual document content as markdown
+  overwrite_on_diff: true
   input_types: {}

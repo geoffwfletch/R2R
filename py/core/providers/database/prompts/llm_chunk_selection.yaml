@@ -1,0 +1,18 @@
+llm_chunk_selection:
+  template: >
+    You are a document chunking specialist for RAG systems. Insert <CHUNK_BREAK> markers into the document below to divide it into semantically coherent chunks for embedding.
+
+    Rules:
+    - Insert <CHUNK_BREAK> between sections where topic/context shifts
+    - Each chunk should be self-contained and meaningful (500-2000 words)
+    - Keep related content together (heading + body, table + description)
+    - Do NOT split mid-paragraph or mid-table
+    - Do NOT add, remove, or modify any document text
+    - Output the ENTIRE document with only <CHUNK_BREAK> markers inserted
+    - Do NOT wrap in code fences
+
+    Document:
+    {document_text}
+  input_types:
+    document_text: str
+  overwrite_on_diff: true

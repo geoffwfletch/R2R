@@ -272,6 +272,21 @@ class VLMPDFParser(AsyncParser[str | bytes]):
         )
         self.semaphore = None
 
+    @staticmethod
+    def _clean_vlm_output(text: str) -> str:
+        """Strip code fences and metadata lines from VLM output."""
+        # Remove ```markdown ... ``` wrapping
+        text = re.sub(r"^```(?:markdown)?\s*\n?", "", text.strip())
+        text = re.sub(r"\n?```\s*$", "", text.strip())
+        # Remove metadata lines the model sometimes adds
+        text = re.sub(
+            r"^(Page number|Header/Footer|Sidebars?/Callouts?):.*$\n?",
+            "",
+            text,
+            flags=re.MULTILINE,
+        )
+        return text.strip()
+
     async def process_page(self, image, page_num: int) -> dict[str, str]:
         """Process a single PDF page using the vision model."""
         page_start = time.perf_counter()
@@ -365,7 +380,7 @@ class VLMPDFParser(AsyncParser[str | bytes]):
                 ):
                     tool_call = response.choices[0].message.tool_calls[0]
                     args = json.loads(tool_call.function.arguments)
-                    content = args.get("page_content", "")
+                    content = self._clean_vlm_output(args.get("page_content", ""))
                     page_elapsed = time.perf_counter() - page_start
                     logger.debug(
                         f"Processed page {page_num} in {page_elapsed:.2f} seconds."
@@ -384,7 +399,9 @@ class VLMPDFParser(AsyncParser[str | bytes]):
                 )
 
                 if response.choices and response.choices[0].message:
-                    content = response.choices[0].message.content
+                    content = self._clean_vlm_output(
+                        response.choices[0].message.content or ""
+                    )
                     page_elapsed = time.perf_counter() - page_start
                     logger.debug(
                         f"Processed page {page_num} in {page_elapsed:.2f} seconds."
@@ -412,6 +429,74 @@ class VLMPDFParser(AsyncParser[str | bytes]):
                 "content": result.get("content", "") or "",
                 "page_number": page_num,
             }
+
+    async def _llm_chunk_selection(
+        self, full_md: str, chunk_model: str
+    ) -> list[str]:
+        """Use an LLM to insert semantic chunk boundaries into the document."""
+        logger.info(
+            f"Running LLM chunk selection with model={chunk_model}, "
+            f"doc_len={len(full_md)} chars"
+        )
+        try:
+            prompt_template = (
+                await self.database_provider.prompts_handler.get_cached_prompt(
+                    prompt_name="llm_chunk_selection"
+                )
+            )
+
+            # Sliding window for long docs (>80k chars)
+            window_size = 80_000
+            overlap = 2_000
+            if len(full_md) <= window_size:
+                segments = [full_md]
+            else:
+                segments = []
+                start = 0
+                while start < len(full_md):
+                    end = min(start + window_size, len(full_md))
+                    segments.append(full_md[start:end])
+                    start = end - overlap
+                    if start + overlap >= len(full_md):
+                        break
+
+            all_chunks: list[str] = []
+            for seg in segments:
+                prompt_text = prompt_template.replace(
+                    "{document_text}", seg
+                )
+                messages = [{"role": "user", "content": prompt_text}]
+                generation_config = GenerationConfig(
+                    model=chunk_model,
+                    stream=False,
+                    temperature=0,
+                    max_tokens_to_sample=16_384,
+                )
+                response = await self.llm_provider.aget_completion(
+                    messages=messages,
+                    generation_config=generation_config,
+                    apply_timeout=True,
+                )
+                if response.choices and response.choices[0].message:
+                    result_text = response.choices[0].message.content or ""
+                    parts = [
+                        p.strip()
+                        for p in result_text.split("<CHUNK_BREAK>")
+                        if p.strip()
+                    ]
+                    all_chunks.extend(parts)
+                else:
+                    all_chunks.append(seg)
+
+            logger.info(
+                f"LLM chunk selection produced {len(all_chunks)} chunks"
+            )
+            return all_chunks if all_chunks else [full_md]
+        except Exception as e:
+            logger.warning(
+                f"LLM chunk selection failed, falling back to single chunk: {e}"
+            )
+            return [full_md]
 
     async def ingest(
         self, data: str | bytes, **kwargs
@@ -443,6 +528,7 @@ class VLMPDFParser(AsyncParser[str | bytes]):
             # Create a task queue to process pages in order
             pending_tasks = []
             completed_tasks = []
+            all_page_contents = []
             next_page_to_yield = 1
 
             # Process pages with a sliding window, in batches
@@ -505,7 +591,9 @@ class VLMPDFParser(AsyncParser[str | bytes]):
                         and completed_tasks[0].page_num == next_page_to_yield
                     ):
                         task = completed_tasks.pop(0)
-                        yield await task
+                        result = await task
+                        all_page_contents.append(result)
+                        yield result
                         next_page_to_yield += 1
 
             # Wait for and yield any remaining tasks in order
@@ -523,8 +611,38 @@ class VLMPDFParser(AsyncParser[str | bytes]):
                     and completed_tasks[0].page_num == next_page_to_yield
                 ):
                     task = completed_tasks.pop(0)
-                    yield await task
+                    result = await task
+                    all_page_contents.append(result)
+                    yield result
                     next_page_to_yield += 1
+
+            # Assemble full markdown preview from all pages
+            if all_page_contents:
+                all_page_contents.sort(
+                    key=lambda x: x.get("page_number", 0)
+                )
+                full_md = "\n\n".join(
+                    p.get("content", "")
+                    for p in all_page_contents
+                    if p.get("content")
+                )
+                if full_md:
+                    yield {
+                        "full_markdown": full_md,
+                        "type": "markdown_preview",
+                    }
+
+                    llm_chunk_model = kwargs.get("llm_chunk_model")
+                    if llm_chunk_model:
+                        chunks = await self._llm_chunk_selection(
+                            full_md, llm_chunk_model
+                        )
+                        for i, chunk_text in enumerate(chunks):
+                            yield {
+                                "content": chunk_text,
+                                "metadata": {"chunk_order": i},
+                                "pre_chunked": True,
+                            }
 
             total_elapsed = time.perf_counter() - ingest_start
             logger.info(
