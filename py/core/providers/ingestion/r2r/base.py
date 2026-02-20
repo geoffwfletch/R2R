@@ -41,7 +41,7 @@ class R2RIngestionProvider(IngestionProvider):
         DocumentType.BMP: parsers.BMPParser,
         DocumentType.CSV: parsers.CSVParser,
         DocumentType.DOC: parsers.DOCParser,
-        DocumentType.DOCX: parsers.DOCXParser,
+        DocumentType.DOCX: parsers.DoclingHybridDOCXParser,
         DocumentType.EML: parsers.EMLParser,
         DocumentType.EPUB: parsers.EPUBParser,
         DocumentType.HTML: parsers.HTMLParser,
@@ -51,7 +51,7 @@ class R2RIngestionProvider(IngestionProvider):
         DocumentType.MSG: parsers.MSGParser,
         DocumentType.ORG: parsers.ORGParser,
         DocumentType.MD: parsers.MDParser,
-        DocumentType.PDF: parsers.BasicPDFParser,
+        DocumentType.PDF: parsers.DoclingHybridPDFParser,
         DocumentType.PPT: parsers.PPTParser,
         DocumentType.PPTX: parsers.PPTXParser,
         DocumentType.TXT: parsers.TextParser,
@@ -81,6 +81,12 @@ class R2RIngestionProvider(IngestionProvider):
             "ocr": parsers.OCRPDFParser,
             "unstructured": parsers.PDFParserUnstructured,
             "zerox": parsers.VLMPDFParser,
+            "docling_markdown": parsers.DoclingMarkdownPDFParser,
+            "text": parsers.BasicPDFParser,
+        },
+        DocumentType.DOCX: {
+            "docling_markdown": parsers.DoclingMarkdownDOCXParser,
+            "text": parsers.DOCXParser,
         },
         DocumentType.XLSX: {"advanced": parsers.XLSXParserAdvanced},
     }
@@ -131,8 +137,6 @@ class R2RIngestionProvider(IngestionProvider):
                     database_provider=self.database_provider,
                     llm_provider=self.llm_provider,
                 )
-        # FIXME: This doesn't allow for flexibility for a parser that might not
-        # need an llm_provider, etc.
         for doc_type, parser_names in self.config.extra_parsers.items():
             if not isinstance(parser_names, list):
                 parser_names = [parser_names]
@@ -141,21 +145,30 @@ class R2RIngestionProvider(IngestionProvider):
                 parser_key = f"{parser_name}_{str(doc_type)}"
 
                 try:
-                    self.parsers[parser_key] = self.EXTRA_PARSERS[doc_type][
-                        parser_name
-                    ](
+                    parser_cls = self.EXTRA_PARSERS[doc_type][parser_name]
+                except KeyError as e:
+                    logger.error(
+                        f"Parser {parser_name} for document type {doc_type} not found: {e}"
+                    )
+                    continue
+
+                # Try with ocr_provider first, fall back without
+                try:
+                    self.parsers[parser_key] = parser_cls(
                         config=self.config,
                         database_provider=self.database_provider,
                         llm_provider=self.llm_provider,
                         ocr_provider=self.ocr_provider,
                     )
-                    logger.info(
-                        f"Initialized extra parser {parser_name} for {doc_type}"
+                except TypeError:
+                    self.parsers[parser_key] = parser_cls(
+                        config=self.config,
+                        database_provider=self.database_provider,
+                        llm_provider=self.llm_provider,
                     )
-                except KeyError as e:
-                    logger.error(
-                        f"Parser {parser_name} for document type {doc_type} not found: {e}"
-                    )
+                logger.info(
+                    f"Initialized extra parser {parser_name} for {doc_type}"
+                )
 
     def _build_text_splitter(
         self, ingestion_config_override: Optional[dict] = None
@@ -205,6 +218,13 @@ class R2RIngestionProvider(IngestionProvider):
                 keep_separator=False,
                 strip_whitespace=True,
             )
+        elif chunking_strategy == ChunkingStrategy.MARKDOWN:
+            from shared.utils.splitter.text import MarkdownChunker
+
+            return MarkdownChunker(
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+            )
         elif chunking_strategy == ChunkingStrategy.BASIC:
             raise NotImplementedError(
                 "Basic chunking method not implemented. Please use Recursive."
@@ -221,6 +241,7 @@ class R2RIngestionProvider(IngestionProvider):
         self,
         parsed_document: str | DocumentChunk,
         ingestion_config_override: dict,
+        preserve_metadata: bool = False,
     ) -> AsyncGenerator[Any, None]:
         text_spliiter = self.text_splitter
         if ingestion_config_override:
@@ -237,9 +258,14 @@ class R2RIngestionProvider(IngestionProvider):
             chunks = parsed_document
 
         for chunk in chunks:
-            yield (
-                chunk.page_content if hasattr(chunk, "page_content") else chunk
-            )
+            if preserve_metadata:
+                yield chunk
+            else:
+                yield (
+                    chunk.page_content
+                    if hasattr(chunk, "page_content")
+                    else chunk
+                )
 
     async def parse(
         self,
@@ -255,64 +281,162 @@ class R2RIngestionProvider(IngestionProvider):
         else:
             t0 = time.time()
             contents = []
+            pre_chunked_contents = []
+            markdown_preview = None
+
             parser_overrides = ingestion_config_override.get(
                 "parser_overrides", {}
             )
-            if document.document_type.value in parser_overrides:
+            doc_type_val = document.document_type.value
+            override_name = parser_overrides.get(doc_type_val)
+
+            # Determine which parser to use
+            if override_name:
                 logger.info(
-                    f"Using parser_override for {document.document_type} with input value {parser_overrides[document.document_type.value]}"
+                    f"Using parser_override for {document.document_type} "
+                    f"with input value {override_name}"
                 )
-                if parser_overrides[DocumentType.PDF.value] == "zerox":
-                    # Collect content from VLMPDFParser
-                    async for chunk in self.parsers[
-                        f"zerox_{DocumentType.PDF.value}"
-                    ].ingest(file_content, **ingestion_config_override):
-                        if isinstance(chunk, dict) and chunk.get("content"):
-                            contents.append(chunk)
-                        elif (
-                            chunk
-                        ):  # Handle string output for backward compatibility
-                            contents.append({"content": chunk})
-                elif parser_overrides[DocumentType.PDF.value] == "ocr":
-                    async for chunk in self.parsers[
-                        f"ocr_{DocumentType.PDF.value}"
-                    ].ingest(file_content, **ingestion_config_override):
-                        if isinstance(chunk, dict) and chunk.get("content"):
-                            contents.append(chunk)
-
-                if (
-                    contents
-                    and document.document_type == DocumentType.PDF
-                    and parser_overrides.get(DocumentType.PDF.value) == "zerox"
-                    or parser_overrides.get(DocumentType.PDF.value) == "ocr"
-                ):
-                    vlm_ocr_one_page_per_chunk = ingestion_config_override.get(
-                        "vlm_ocr_one_page_per_chunk", True
+                parser_key = f"{override_name}_{doc_type_val}"
+                if parser_key not in self.parsers:
+                    raise R2RDocumentProcessingError(
+                        document_id=document.id,
+                        error_message=f"Override parser '{override_name}' for {doc_type_val} not found.",
                     )
+                parser = self.parsers[parser_key]
+            else:
+                parser = self.parsers[document.document_type]
 
-                    if vlm_ocr_one_page_per_chunk:
-                        # Use one page per chunk for OCR/VLM
-                        iteration = 0
+            # Collect output from parser
+            async for item in parser.ingest(
+                file_content, **ingestion_config_override, document=document
+            ):
+                if item is None:
+                    continue
 
-                        sorted_contents = [
-                            item
-                            for item in sorted(
-                                contents, key=lambda x: x.get("page_number", 0)
-                            )
-                            if isinstance(item.get("content"), str)
-                        ]
+                if isinstance(item, dict):
+                    # Markdown preview signal
+                    if item.get("type") == "markdown_preview":
+                        markdown_preview = item.get("full_markdown")
+                        continue
 
-                        for content_item in sorted_contents:
-                            page_num = content_item.get("page_number", 0)
-                            page_content = content_item["content"]
+                    # Pre-chunked content (from HybridChunker)
+                    if item.get("pre_chunked"):
+                        pre_chunked_contents.append(item)
+                        continue
 
-                            # Create a document chunk directly from the page content
+                    # Dict with content (OCR/VLM page-based)
+                    if item.get("content"):
+                        contents.append(item)
+                    elif item.get("metadata"):
+                        contents.append(
+                            {
+                                "content": item.get("content", ""),
+                                "metadata": item.get("metadata", {}),
+                            }
+                        )
+                else:
+                    contents.append({"content": item})
+
+            # Store markdown preview if available
+            if markdown_preview is not None:
+                ingestion_config_override[
+                    "_markdown_preview"
+                ] = markdown_preview
+
+            # Handle pre-chunked output (docling_hybrid)
+            if pre_chunked_contents:
+                iteration = 0
+                for item in pre_chunked_contents:
+                    chunk_meta = item.get("metadata", {})
+                    metadata = {
+                        **document.metadata,
+                        "chunk_order": chunk_meta.get(
+                            "chunk_order", iteration
+                        ),
+                    }
+
+                    extraction = DocumentChunk(
+                        id=generate_extraction_id(document.id, iteration),
+                        document_id=document.id,
+                        owner_id=document.owner_id,
+                        collection_ids=document.collection_ids,
+                        data=item["content"],
+                        metadata=metadata,
+                    )
+                    iteration += 1
+                    yield extraction
+
+                logger.debug(
+                    f"Parsed document with id={document.id}, "
+                    f"title={document.metadata.get('title', None)}, "
+                    f"into {iteration} pre-chunked extractions "
+                    f"in t={time.time() - t0:.2f} seconds."
+                )
+                return
+
+            # Handle OCR/VLM page-based output with one-page-per-chunk option
+            if (
+                contents
+                and override_name in ("zerox", "ocr")
+            ):
+                vlm_ocr_one_page_per_chunk = ingestion_config_override.get(
+                    "vlm_ocr_one_page_per_chunk", True
+                )
+
+                sorted_contents = [
+                    item
+                    for item in sorted(
+                        contents,
+                        key=lambda x: x.get("page_number", 0),
+                    )
+                    if isinstance(item.get("content"), str)
+                ]
+
+                if vlm_ocr_one_page_per_chunk:
+                    iteration = 0
+                    for content_item in sorted_contents:
+                        page_num = content_item.get("page_number", 0)
+                        metadata = {
+                            **document.metadata,
+                            "chunk_order": iteration,
+                            "page_number": page_num,
+                        }
+                        extraction = DocumentChunk(
+                            id=generate_extraction_id(
+                                document.id, iteration
+                            ),
+                            document_id=document.id,
+                            owner_id=document.owner_id,
+                            collection_ids=document.collection_ids,
+                            data=content_item["content"],
+                            metadata=metadata,
+                        )
+                        iteration += 1
+                        yield extraction
+
+                    logger.debug(
+                        f"Parsed document with id={document.id}, "
+                        f"into {iteration} extractions "
+                        f"in t={time.time() - t0:.2f} seconds "
+                        f"using one-page-per-chunk."
+                    )
+                    return
+                else:
+                    text_splitter = self._build_text_splitter(
+                        ingestion_config_override
+                    )
+                    iteration = 0
+                    for content_item in sorted_contents:
+                        page_num = content_item.get("page_number", 0)
+                        page_chunks = text_splitter.create_documents(
+                            [content_item["content"]]
+                        )
+                        for chunk in page_chunks:
                             metadata = {
                                 **document.metadata,
                                 "chunk_order": iteration,
                                 "page_number": page_num,
                             }
-
                             extraction = DocumentChunk(
                                 id=generate_extraction_id(
                                     document.id, iteration
@@ -320,86 +444,19 @@ class R2RIngestionProvider(IngestionProvider):
                                 document_id=document.id,
                                 owner_id=document.owner_id,
                                 collection_ids=document.collection_ids,
-                                data=page_content,
+                                data=chunk.page_content,
                                 metadata=metadata,
                             )
                             iteration += 1
                             yield extraction
 
-                        logger.debug(
-                            f"Parsed document with id={document.id}, title={document.metadata.get('title', None)}, "
-                            f"user_id={document.metadata.get('user_id', None)}, metadata={document.metadata} "
-                            f"into {iteration} extractions in t={time.time() - t0:.2f} seconds using one-page-per-chunk."
-                        )
-                        return
-                    else:
-                        # Text splitting
-                        text_splitter = self._build_text_splitter(
-                            ingestion_config_override
-                        )
-
-                        iteration = 0
-
-                        sorted_contents = [
-                            item
-                            for item in sorted(
-                                contents, key=lambda x: x.get("page_number", 0)
-                            )
-                            if isinstance(item.get("content"), str)
-                        ]
-
-                        for content_item in sorted_contents:
-                            page_num = content_item.get("page_number", 0)
-                            page_content = content_item["content"]
-
-                            page_chunks = text_splitter.create_documents(
-                                [page_content]
-                            )
-
-                            # Create document chunks for each split piece
-                            for chunk in page_chunks:
-                                metadata = {
-                                    **document.metadata,
-                                    "chunk_order": iteration,
-                                    "page_number": page_num,
-                                }
-
-                                extraction = DocumentChunk(
-                                    id=generate_extraction_id(
-                                        document.id, iteration
-                                    ),
-                                    document_id=document.id,
-                                    owner_id=document.owner_id,
-                                    collection_ids=document.collection_ids,
-                                    data=chunk.page_content,
-                                    metadata=metadata,
-                                )
-                                iteration += 1
-                                yield extraction
-
-                        logger.debug(
-                            f"Parsed document with id={document.id}, title={document.metadata.get('title', None)}, "
-                            f"user_id={document.metadata.get('user_id', None)}, metadata={document.metadata} "
-                            f"into {iteration} extractions in t={time.time() - t0:.2f} seconds using page-by-page splitting."
-                        )
-                        return
-
-            else:
-                # Standard parsing for non-override cases
-                async for text in self.parsers[document.document_type].ingest(
-                    file_content,
-                    **ingestion_config_override,
-                    document=document,
-                ):
-                    if text is not None and isinstance(text, dict):
-                        contents.append(
-                            {
-                                "content": text.get("content", ""),
-                                "metadata": text.get("metadata", {}),
-                            }
-                        )
-                    elif text is not None:
-                        contents.append({"content": text})
+                    logger.debug(
+                        f"Parsed document with id={document.id}, "
+                        f"into {iteration} extractions "
+                        f"in t={time.time() - t0:.2f} seconds "
+                        f"using page-by-page splitting."
+                    )
+                    return
 
             if not contents:
                 logging.warning(
@@ -407,34 +464,54 @@ class R2RIngestionProvider(IngestionProvider):
                 )
                 return
 
+            # Auto-select markdown chunking for docling_markdown override
+            effective_override = dict(ingestion_config_override)
+            if override_name == "docling_markdown":
+                effective_override.setdefault(
+                    "chunking_strategy", ChunkingStrategy.MARKDOWN
+                )
+
             iteration = 0
             for content_item in contents:
                 chunk_text = content_item["content"]
                 parser_generated = content_item.get("metadata", {})
-                chunks = self.chunk(chunk_text, ingestion_config_override)
+                chunks = self.chunk(
+                    chunk_text, effective_override, preserve_metadata=True
+                )
 
                 for chunk in chunks:
+                    # Handle SplitterDocument from MarkdownChunker
+                    if hasattr(chunk, "page_content"):
+                        chunk_data = chunk.page_content
+                        chunk_metadata = getattr(chunk, "metadata", {})
+                    else:
+                        chunk_data = chunk
+                        chunk_metadata = {}
+
                     metadata = {**document.metadata, "chunk_order": iteration}
                     if "page_number" in content_item:
                         metadata["page_number"] = content_item["page_number"]
                     if parser_generated:
                         metadata["parser_generated"] = parser_generated
+                    if chunk_metadata:
+                        metadata["section_headers"] = chunk_metadata
 
                     extraction = DocumentChunk(
                         id=generate_extraction_id(document.id, iteration),
                         document_id=document.id,
                         owner_id=document.owner_id,
                         collection_ids=document.collection_ids,
-                        data=chunk,
+                        data=chunk_data,
                         metadata=metadata,
                     )
                     iteration += 1
                     yield extraction
 
             logger.debug(
-                f"Parsed document with id={document.id}, title={document.metadata.get('title', None)}, "
-                f"user_id={document.metadata.get('user_id', None)}, metadata={document.metadata} "
-                f"into {iteration} extractions in t={time.time() - t0:.2f} seconds."
+                f"Parsed document with id={document.id}, "
+                f"title={document.metadata.get('title', None)}, "
+                f"into {iteration} extractions "
+                f"in t={time.time() - t0:.2f} seconds."
             )
 
     def get_parser_for_document_type(self, doc_type: DocumentType) -> Any:

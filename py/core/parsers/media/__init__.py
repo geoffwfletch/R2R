@@ -2,11 +2,17 @@
 from .audio_parser import AudioParser
 from .bmp_parser import BMPParser
 from .doc_parser import DOCParser
-from .docx_parser import DOCXParser
+from .docx_parser import (
+    DOCXParser,
+    DoclingHybridDOCXParser,
+    DoclingMarkdownDOCXParser,
+)
 from .img_parser import ImageParser
 from .odt_parser import ODTParser
 from .pdf_parser import (
     BasicPDFParser,
+    DoclingHybridPDFParser,
+    DoclingMarkdownPDFParser,
     OCRPDFParser,
     PDFParserUnstructured,
     VLMPDFParser,
@@ -20,11 +26,15 @@ __all__ = [
     "BMPParser",
     "DOCParser",
     "DOCXParser",
+    "DoclingHybridDOCXParser",
+    "DoclingMarkdownDOCXParser",
     "ImageParser",
     "ODTParser",
     "OCRPDFParser",
     "VLMPDFParser",
     "BasicPDFParser",
+    "DoclingHybridPDFParser",
+    "DoclingMarkdownPDFParser",
     "PDFParserUnstructured",
     "PPTParser",
     "PPTXParser",

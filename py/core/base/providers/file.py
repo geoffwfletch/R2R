@@ -25,14 +25,17 @@ class FileConfig(ProviderConfig):
     region_name: Optional[str] = None
     endpoint_url: Optional[str] = None
 
+    # Azure Blob-specific configuration
+    azure_account_name: Optional[str] = None
+    azure_account_key: Optional[str] = None
+    azure_container_name: Optional[str] = None
+
     @property
     def supported_providers(self) -> list[str]:
-        """
-        List of supported file storage providers.
-        """
         return [
             "postgres",
             "s3",
+            "azure_blob",
         ]
 
     def validate_config(self) -> None:
@@ -44,6 +47,14 @@ class FileConfig(ProviderConfig):
         ):
             raise ValueError(
                 "S3 bucket name is required when using S3 provider"
+            )
+
+        if self.provider == "azure_blob" and (
+            not self.azure_container_name
+            and not os.getenv("AZURE_BLOB_CONTAINER_NAME")
+        ):
+            raise ValueError(
+                "Azure container name is required when using azure_blob provider"
             )
 
 
@@ -108,3 +119,18 @@ class FileProvider(Provider, ABC):
     ) -> list[dict]:
         """Get an overview of stored files."""
         pass
+
+    async def store_markdown_preview(
+        self,
+        document_id: UUID,
+        file_name: str,
+        markdown_content: str,
+    ) -> None:
+        """Store markdown preview alongside original file. Optional."""
+        pass
+
+    async def retrieve_markdown_preview(
+        self, document_id: UUID
+    ) -> Optional[str]:
+        """Retrieve markdown preview. Optional."""
+        return None

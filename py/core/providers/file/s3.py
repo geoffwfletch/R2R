@@ -205,6 +205,15 @@ class S3FileProvider(FileProvider):
             # Delete from S3
             self.s3_client.delete_object(Bucket=self.bucket_name, Key=s3_key)
 
+            # Also clean up markdown preview if exists
+            try:
+                preview_key = self._get_preview_key(document_id)
+                self.s3_client.delete_object(
+                    Bucket=self.bucket_name, Key=preview_key
+                )
+            except ClientError:
+                pass
+
             return True
 
         except ClientError as e:
@@ -218,6 +227,39 @@ class S3FileProvider(FileProvider):
             raise R2RException(
                 status_code=500, message=f"Failed to delete file from S3: {e}"
             ) from e
+
+    def _get_preview_key(self, document_id: UUID) -> str:
+        return f"documents/{document_id}/preview.md"
+
+    async def store_markdown_preview(
+        self,
+        document_id: UUID,
+        file_name: str,
+        markdown_content: str,
+    ) -> None:
+        try:
+            key = self._get_preview_key(document_id)
+            self.s3_client.put_object(
+                Bucket=self.bucket_name,
+                Key=key,
+                Body=markdown_content.encode("utf-8"),
+                ContentType="text/markdown",
+                Metadata={"document_id": str(document_id)},
+            )
+        except Exception as e:
+            logger.error(f"Error storing markdown preview in S3: {e}")
+
+    async def retrieve_markdown_preview(
+        self, document_id: UUID
+    ) -> Optional[str]:
+        key = self._get_preview_key(document_id)
+        try:
+            response = self.s3_client.get_object(
+                Bucket=self.bucket_name, Key=key
+            )
+            return response["Body"].read().decode("utf-8")
+        except ClientError:
+            return None
 
     async def get_files_overview(
         self,

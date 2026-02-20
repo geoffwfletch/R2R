@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 class ChunkingStrategy(str, Enum):
     RECURSIVE = "recursive"
     CHARACTER = "character"
+    MARKDOWN = "markdown"
     BASIC = "basic"
     BY_TITLE = "by_title"
 

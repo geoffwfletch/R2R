@@ -60,6 +60,10 @@ provider = "bcrypt"
 
 [file]
 provider = "postgres"
+# provider = "azure_blob"
+# azure_account_name = ""      # or set AZURE_BLOB_ACCOUNT_NAME
+# azure_account_key = ""        # or set AZURE_BLOB_ACCOUNT_KEY
+# azure_container_name = ""     # or set AZURE_BLOB_CONTAINER_NAME
 
 [database]
 default_collection_name = "Default"
@@ -116,7 +120,8 @@ vlm_ocr_one_page_per_chunk = true
     n_chunks = 2 # the number of chunks (both preceding and succeeding) to use in enrichment
 
   [ingestion.extra_parsers]
-    pdf = ["zerox", "ocr"]
+    pdf = ["zerox", "ocr", "docling_markdown", "text"]
+    docx = ["docling_markdown", "text"]
 
 [ocr]
 provider = "mistral"

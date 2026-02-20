@@ -44,6 +44,15 @@ class PostgresFileProvider(FileProvider):
             updated_at TIMESTAMPTZ DEFAULT NOW()
         );
 
+        CREATE TABLE IF NOT EXISTS {self._get_table_name('markdown_previews')} (
+            document_id UUID PRIMARY KEY,
+            name TEXT NOT NULL,
+            oid OID NOT NULL,
+            size BIGINT NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+
         -- Create trigger for updating the updated_at timestamp
         CREATE OR REPLACE FUNCTION {self.project_name}.update_files_updated_at()
         RETURNS TRIGGER AS $$
@@ -58,6 +67,14 @@ class PostgresFileProvider(FileProvider):
 
         CREATE TRIGGER update_files_updated_at
             BEFORE UPDATE ON {self._get_table_name(self.table_name)}
+            FOR EACH ROW
+            EXECUTE FUNCTION {self.project_name}.update_files_updated_at();
+
+        DROP TRIGGER IF EXISTS update_markdown_previews_updated_at
+        ON {self._get_table_name('markdown_previews')};
+
+        CREATE TRIGGER update_markdown_previews_updated_at
+            BEFORE UPDATE ON {self._get_table_name('markdown_previews')}
             FOR EACH ROW
             EXECUTE FUNCTION {self.project_name}.update_files_updated_at();
         """
@@ -281,6 +298,18 @@ class PostgresFileProvider(FileProvider):
 
                 await self._delete_lobject(conn, oid)
 
+                # Also clean up markdown preview if exists
+                preview_oid = await conn.fetchval(
+                    f"SELECT oid FROM {self._get_table_name('markdown_previews')} WHERE document_id = $1",
+                    document_id,
+                )
+                if preview_oid:
+                    await self._delete_lobject(conn, preview_oid)
+                    await conn.execute(
+                        f"DELETE FROM {self._get_table_name('markdown_previews')} WHERE document_id = $1",
+                        document_id,
+                    )
+
                 delete_query = f"""
                 DELETE FROM {self._get_table_name(self.table_name)}
                 WHERE document_id = $1
@@ -292,6 +321,75 @@ class PostgresFileProvider(FileProvider):
     async def _delete_lobject(self, conn, oid: int) -> None:
         """Delete a large object."""
         await conn.execute("SELECT lo_unlink($1)", oid)
+
+    async def store_markdown_preview(
+        self,
+        document_id: UUID,
+        file_name: str,
+        markdown_content: str,
+    ) -> None:
+        """Store markdown preview as a large object in postgres."""
+        content_bytes = markdown_content.encode("utf-8")
+        md_name = file_name.rsplit(".", 1)[0] + ".md"
+
+        async with (
+            self.connection_manager.pool.get_connection() as conn  # type: ignore
+        ):
+            async with conn.transaction():
+                # Unlink old large object to prevent storage leak
+                old_oid = await conn.fetchval(
+                    f"SELECT oid FROM {self._get_table_name('markdown_previews')} WHERE document_id = $1",
+                    document_id,
+                )
+                if old_oid:
+                    await conn.execute(
+                        "SELECT lo_unlink($1)", old_oid
+                    )
+
+                oid = await conn.fetchval("SELECT lo_create(0)")
+                lobject = await conn.fetchval(
+                    "SELECT lo_open($1, $2)", oid, 0x20000
+                )
+                await conn.execute(
+                    "SELECT lowrite($1, $2)", lobject, content_bytes
+                )
+                await conn.execute("SELECT lo_close($1)", lobject)
+
+                query = f"""
+                INSERT INTO {self._get_table_name('markdown_previews')}
+                (document_id, name, oid, size)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (document_id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    oid = EXCLUDED.oid,
+                    size = EXCLUDED.size,
+                    updated_at = NOW();
+                """
+                await conn.execute(
+                    query,
+                    document_id,
+                    md_name,
+                    oid,
+                    len(content_bytes),
+                )
+
+    async def retrieve_markdown_preview(
+        self, document_id: UUID
+    ) -> Optional[str]:
+        """Retrieve markdown preview from postgres."""
+        query = f"""
+        SELECT oid FROM {self._get_table_name('markdown_previews')}
+        WHERE document_id = $1
+        """
+        result = await self.connection_manager.fetchrow_query(
+            query, [document_id]
+        )
+        if not result:
+            return None
+
+        async with self.connection_manager.pool.get_connection() as conn:  # type: ignore
+            content = await self._read_lobject(conn, result["oid"])
+            return content.decode("utf-8")
 
     async def get_files_overview(
         self,

@@ -720,6 +720,11 @@ class RetrievalService(Service):
         # 4) Possibly augment text or metadata
         final_results = []
         for r in reranked:
+            if "section_headers" in r.metadata and search_settings.include_metadatas:
+                headers = r.metadata["section_headers"]
+                header_str = " > ".join(v for v in headers.values() if v)
+                if header_str:
+                    r.text = f"Section: {header_str}\n\n{r.text}"
             if "title" in r.metadata and search_settings.include_metadatas:
                 title = r.metadata["title"]
                 r.text = f"Document Title: {title}\n\nText: {r.text}"

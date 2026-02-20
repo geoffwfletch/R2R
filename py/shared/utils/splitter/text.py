@@ -1998,3 +1998,84 @@ class RecursiveJsonSplitter:
                 )
                 documents.append(new_doc)
         return documents
+
+
+class MarkdownChunker:
+    """Two-stage markdown chunker: header split then recursive size split."""
+
+    def __init__(
+        self,
+        chunk_size: int = 1024,
+        chunk_overlap: int = 512,
+    ):
+        self.header_splitter = MarkdownHeaderTextSplitter(
+            headers_to_split_on=[
+                ("#", "Header 1"),
+                ("##", "Header 2"),
+                ("###", "Header 3"),
+            ],
+            strip_headers=False,
+        )
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
+
+    def create_documents(
+        self, texts: list[str]
+    ) -> list[SplitterDocument]:
+        all_docs: list[SplitterDocument] = []
+        for text in texts:
+            header_docs = self.header_splitter.split_text(text)
+            header_docs = self._merge_orphan_headings(header_docs)
+            sized_docs = self.text_splitter.split_documents(header_docs)
+            all_docs.extend(sized_docs)
+        return all_docs
+
+    @staticmethod
+    def _merge_orphan_headings(
+        docs: list[SplitterDocument],
+    ) -> list[SplitterDocument]:
+        """Merge heading-only chunks into the next chunk.
+
+        Docling flattens heading hierarchy so parent/child headings both
+        become ## peers. The header splitter then creates tiny orphan
+        chunks that contain only a heading line with no body text.
+        This pass prepends each orphan into the following chunk.
+        """
+        if not docs:
+            return docs
+
+        import re
+
+        heading_re = re.compile(r"^#+\s")
+        merged: list[SplitterDocument] = []
+        pending_prefix = ""
+
+        for doc in docs:
+            lines = [l for l in doc.page_content.strip().splitlines() if l.strip()]
+            is_heading_only = bool(lines) and all(
+                heading_re.match(l) for l in lines
+            )
+
+            if is_heading_only:
+                pending_prefix += doc.page_content.rstrip() + "\n\n"
+            else:
+                if pending_prefix:
+                    doc = SplitterDocument(
+                        page_content=pending_prefix + doc.page_content,
+                        metadata=doc.metadata,
+                    )
+                    pending_prefix = ""
+                merged.append(doc)
+
+        # trailing heading-only doc with no next — keep as-is
+        if pending_prefix:
+            merged.append(
+                SplitterDocument(
+                    page_content=pending_prefix.rstrip(),
+                    metadata=docs[-1].metadata,
+                )
+            )
+
+        return merged

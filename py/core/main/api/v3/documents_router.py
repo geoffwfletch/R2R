@@ -1387,6 +1387,79 @@ class DocumentsRouter(BaseRouterV3):
                 },
             )
 
+        @self.router.get(
+            "/documents/{id}/preview",
+            dependencies=[Depends(self.rate_limit_dependency)],
+            summary="Get markdown preview of a document",
+        )
+        @self.base_endpoint
+        async def get_document_preview(
+            id: str = Path(..., description="Document ID"),
+            auth_user=Depends(self.providers.auth.auth_wrapper()),
+        ):
+            """Returns the markdown preview of a document if available.
+
+            Markdown previews are generated during ingestion for documents
+            processed with docling-based parsers.
+            """
+            try:
+                document_uuid = UUID(id)
+            except ValueError:
+                raise R2RException(
+                    status_code=422,
+                    message="Invalid document ID format.",
+                ) from None
+
+            documents_overview_response = (
+                await self.services.management.documents_overview(
+                    user_ids=None,
+                    collection_ids=None,
+                    document_ids=[document_uuid],
+                    offset=0,
+                    limit=1,
+                )
+            )
+            if not documents_overview_response["results"]:
+                raise R2RException("Document not found.", 404)
+
+            document = documents_overview_response["results"][0]
+            is_owner = str(document.owner_id) == str(auth_user.id)
+
+            if not auth_user.is_superuser and not is_owner:
+                document_collections = (
+                    await self.services.management.collections_overview(
+                        offset=0,
+                        limit=-1,
+                        document_ids=[document_uuid],
+                    )
+                )
+                document_collection_ids = {
+                    str(ele.id)
+                    for ele in document_collections["results"]
+                }
+                user_collection_ids = {
+                    str(cid) for cid in auth_user.collection_ids
+                }
+                if not user_collection_ids.intersection(
+                    document_collection_ids
+                ):
+                    raise R2RException(
+                        "Not authorized to access this document.", 403
+                    )
+
+            markdown = (
+                await self.providers.file.retrieve_markdown_preview(
+                    document_uuid
+                )
+            )
+            if markdown is None:
+                raise R2RException(
+                    status_code=404,
+                    message="No markdown preview available for this document.",
+                )
+
+            return {"document_id": id, "markdown": markdown}
+
         @self.router.delete(
             "/documents/by-filter",
             dependencies=[Depends(self.rate_limit_dependency)],

@@ -47,5 +47,6 @@ base_model = "azure/text-embedding-3-large"
 base_dimension = 512
 
 [ingestion]
-chunk_size = 1024
-chunk_overlap = 200
+chunk_size = 4096
+chunk_overlap = 512
+chunking_strategy = "markdown"

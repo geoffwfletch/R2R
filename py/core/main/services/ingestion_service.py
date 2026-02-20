@@ -276,6 +276,20 @@ class IngestionService:
                 extraction.metadata["version"] = version
                 yield extraction
 
+            # Store markdown preview if parser produced one
+            md_preview = ingestion_config_override.pop(
+                "_markdown_preview", None
+            )
+            if md_preview is not None:
+                try:
+                    await self.providers.file.store_markdown_preview(
+                        document_info.id, file_name, md_preview
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to store markdown preview for {document_info.id}: {e}"
+                    )
+
         except (PopplerNotFoundError, PDFParsingError) as e:
             raise R2RDocumentProcessingError(
                 error_message=e.message,

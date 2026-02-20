@@ -14,6 +14,7 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 RUN mkdir -p /app/py
 WORKDIR /app/py
 COPY pyproject.toml ./
+RUN pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 RUN pip install -e ".[core]" && \
     pip install gunicorn uvicorn pydantic
 
