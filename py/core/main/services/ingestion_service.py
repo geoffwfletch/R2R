@@ -276,14 +276,20 @@ class IngestionService:
                 extraction.metadata["version"] = version
                 yield extraction
 
-            # Store markdown preview if parser produced one
+            # Store markdown preview if parser produced one.
+            # If chunked preview exists (LLM output with <CHUNK_BREAK>
+            # markers), use that instead so user can see chunk boundaries.
+            chunked_preview = ingestion_config_override.pop(
+                "_chunked_markdown_preview", None
+            )
             md_preview = ingestion_config_override.pop(
                 "_markdown_preview", None
             )
-            if md_preview is not None:
+            preview_to_store = chunked_preview or md_preview
+            if preview_to_store is not None:
                 try:
                     await self.providers.file.store_markdown_preview(
-                        document_info.id, file_name, md_preview
+                        document_info.id, file_name, preview_to_store
                     )
                 except Exception as e:
                     logger.warning(

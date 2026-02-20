@@ -283,6 +283,7 @@ class R2RIngestionProvider(IngestionProvider):
             contents = []
             pre_chunked_contents = []
             markdown_preview = None
+            chunked_markdown_preview = None
 
             parser_overrides = ingestion_config_override.get(
                 "parser_overrides", {}
@@ -319,6 +320,13 @@ class R2RIngestionProvider(IngestionProvider):
                         markdown_preview = item.get("full_markdown")
                         continue
 
+                    # Chunked markdown preview (LLM output with markers)
+                    if item.get("type") == "chunked_markdown_preview":
+                        chunked_markdown_preview = item.get(
+                            "full_markdown"
+                        )
+                        continue
+
                     # Pre-chunked content (from HybridChunker)
                     if item.get("pre_chunked"):
                         pre_chunked_contents.append(item)
@@ -342,6 +350,12 @@ class R2RIngestionProvider(IngestionProvider):
                 ingestion_config_override[
                     "_markdown_preview"
                 ] = markdown_preview
+
+            # Store chunked markdown preview if available
+            if chunked_markdown_preview is not None:
+                ingestion_config_override[
+                    "_chunked_markdown_preview"
+                ] = chunked_markdown_preview
 
             # Handle pre-chunked output (docling_hybrid)
             if pre_chunked_contents:

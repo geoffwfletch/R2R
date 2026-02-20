@@ -432,8 +432,11 @@ class VLMPDFParser(AsyncParser[str | bytes]):
 
     async def _llm_chunk_selection(
         self, full_md: str, chunk_model: str
-    ) -> list[str]:
-        """Use an LLM to insert semantic chunk boundaries into the document."""
+    ) -> tuple[list[str], str]:
+        """Use an LLM to insert semantic chunk boundaries into the document.
+
+        Returns (chunks, raw_llm_output_with_markers).
+        """
         logger.info(
             f"Running LLM chunk selection with model={chunk_model}, "
             f"doc_len={len(full_md)} chars"
@@ -461,6 +464,7 @@ class VLMPDFParser(AsyncParser[str | bytes]):
                         break
 
             all_chunks: list[str] = []
+            raw_segments: list[str] = []
             for seg in segments:
                 prompt_text = prompt_template.replace(
                     "{document_text}", seg
@@ -479,6 +483,7 @@ class VLMPDFParser(AsyncParser[str | bytes]):
                 )
                 if response.choices and response.choices[0].message:
                     result_text = response.choices[0].message.content or ""
+                    raw_segments.append(result_text)
                     parts = [
                         p.strip()
                         for p in result_text.split("<CHUNK_BREAK>")
@@ -486,17 +491,22 @@ class VLMPDFParser(AsyncParser[str | bytes]):
                     ]
                     all_chunks.extend(parts)
                 else:
+                    raw_segments.append(seg)
                     all_chunks.append(seg)
 
+            raw_output = "\n\n".join(raw_segments)
             logger.info(
                 f"LLM chunk selection produced {len(all_chunks)} chunks"
             )
-            return all_chunks if all_chunks else [full_md]
+            return (
+                all_chunks if all_chunks else [full_md],
+                raw_output,
+            )
         except Exception as e:
             logger.warning(
                 f"LLM chunk selection failed, falling back to single chunk: {e}"
             )
-            return [full_md]
+            return [full_md], full_md
 
     async def ingest(
         self, data: str | bytes, **kwargs
@@ -634,9 +644,15 @@ class VLMPDFParser(AsyncParser[str | bytes]):
 
                     llm_chunk_model = kwargs.get("llm_chunk_model")
                     if llm_chunk_model:
-                        chunks = await self._llm_chunk_selection(
-                            full_md, llm_chunk_model
+                        chunks, raw_output = (
+                            await self._llm_chunk_selection(
+                                full_md, llm_chunk_model
+                            )
                         )
+                        yield {
+                            "full_markdown": raw_output,
+                            "type": "chunked_markdown_preview",
+                        }
                         for i, chunk_text in enumerate(chunks):
                             yield {
                                 "content": chunk_text,
