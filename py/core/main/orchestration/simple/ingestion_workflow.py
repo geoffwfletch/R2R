@@ -65,12 +65,21 @@ def simple_ingestion_factory(service: IngestionService):
                 total_tokens += num_tokens(text_data)
             document_info.total_tokens = total_tokens
 
+            # Transfer LLM usage from parsing phase to document metadata
+            if ingestion_config.get('_llm_usage_vlm'):
+                document_info.metadata['llm_usage_vlm'] = ingestion_config.pop('_llm_usage_vlm')
+            if ingestion_config.get('_llm_usage_chunk_selection'):
+                document_info.metadata['llm_usage_chunk_selection'] = ingestion_config.pop('_llm_usage_chunk_selection')
+
             if not ingestion_config.get("skip_document_summary", False):
                 await service.update_document_status(
                     document_info=document_info,
                     status=IngestionStatus.AUGMENTING,
                 )
                 await service.augment_document_info(document_info, extractions)
+
+            if hasattr(service.providers.embedding, 'reset_embedding_usage'):
+                service.providers.embedding.reset_embedding_usage()
 
             await service.update_document_status(
                 document_info, status=IngestionStatus.EMBEDDING
@@ -80,6 +89,15 @@ def simple_ingestion_factory(service: IngestionService):
                 embedding.model_dump()
                 async for embedding in embedding_generator
             ]
+
+            if hasattr(service.providers.embedding, 'get_embedding_usage'):
+                emb_usage = service.providers.embedding.get_embedding_usage()
+                if emb_usage.get('prompt_tokens', 0) > 0:
+                    document_info.metadata['llm_usage_embedding'] = {
+                        'prompt_tokens': emb_usage['prompt_tokens'],
+                        'total_tokens': emb_usage['total_tokens'],
+                        'model': service.providers.embedding.base_model,
+                    }
 
             await service.update_document_status(
                 document_info, status=IngestionStatus.STORING

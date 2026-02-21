@@ -17,6 +17,7 @@ from ..abstractions import (
     GraphEntityResult,
     GraphRelationshipResult,
 )
+from ..abstractions.search import ChunkSearchResult
 from ..abstractions.vector import VectorQuantizationType
 
 logger = logging.getLogger()
@@ -642,6 +643,53 @@ def num_tokens(text, model="gpt-4o"):
         encoding = tiktoken.get_encoding("cl100k_base")
 
     return len(encoding.encode(text, disallowed_special=()))
+
+
+def expand_chunks_to_parents(
+    chunk_results: list[ChunkSearchResult],
+) -> list[ChunkSearchResult]:
+    """For chunks with parent_key metadata (OCR vision), group by parent_key
+    and substitute parent_content as the text. Deduplicates to one entry
+    per parent at the highest score.
+    Chunks without parent_key pass through unchanged.
+    """
+    expanded: dict[str, ChunkSearchResult] = {}
+    passthrough: list[ChunkSearchResult] = []
+
+    for chunk in chunk_results:
+        parent_key = chunk.metadata.get("parent_key")
+        if parent_key is None:
+            passthrough.append(chunk)
+            continue
+
+        parent_content = chunk.metadata.get("parent_content", chunk.text)
+        score = chunk.score or 0.0
+
+        if parent_key not in expanded or score > (
+            expanded[parent_key].score or 0.0
+        ):
+            # Show matched excerpt first, then full parent section
+            matched_text = chunk.text or ""
+            if matched_text and matched_text.strip() != parent_content.strip():
+                combined_text = (
+                    f"[Matched excerpt]\n{matched_text}\n\n"
+                    f"[Full section]\n{parent_content}"
+                )
+            else:
+                combined_text = parent_content
+            expanded[parent_key] = ChunkSearchResult(
+                id=chunk.id,
+                document_id=chunk.document_id,
+                owner_id=chunk.owner_id,
+                collection_ids=chunk.collection_ids,
+                score=score,
+                text=combined_text,
+                metadata=chunk.metadata,
+            )
+
+    combined = passthrough + list(expanded.values())
+    combined.sort(key=lambda c: c.score or 0.0, reverse=True)
+    return combined
 
 
 class CombinedMeta(AsyncSyncMeta, ABCMeta):

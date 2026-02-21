@@ -105,14 +105,17 @@ concurrent_request_limit = 256
 
 [ingestion]
 provider = "r2r"
-chunking_strategy = "recursive"
-chunk_size = 1_024
-chunk_overlap = 512
+chunking_strategy = "markdown_parent_child"
+chunk_size = 400          # child chunk size (embedded text window)
+chunk_overlap = 0         # no overlap needed — parent_content retrieval covers context
 excluded_parsers = []
 automatic_extraction = true # enable automatic extraction of entities and relations
 vlm_batch_size=20
 max_concurrent_vlm_tasks=20
-vlm_ocr_one_page_per_chunk = true
+vlm_pages_per_call=1
+vlm_ocr_one_page_per_chunk = false
+parent_word_limit = 1500  # ## sections > this many words use ### subsections as parents
+max_parent_chars = 10000  # hard cap on parent_content sent to LLM (0 = no cap)
 
   [ingestion.chunk_enrichment_settings]
     chunk_enrichment_prompt = "chunk_enrichment"

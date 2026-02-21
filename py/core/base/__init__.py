@@ -113,6 +113,7 @@ __all__ = [
     "RecursiveCharacterTextSplitter",
     "TextSplitter",
     "format_search_results_for_llm",
+    "expand_chunks_to_parents",
     "validate_uuid",
     # ID generation
     "generate_id",

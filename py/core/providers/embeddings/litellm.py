@@ -63,6 +63,7 @@ class LiteLLMEmbeddingProvider(EmbeddingProvider):
             logger.warning("Amazon embedding model detected, dropping params")
             litellm.drop_params = True
         self.base_dimension = config.base_dimension
+        self._embedding_usage = {"prompt_tokens": 0, "total_tokens": 0}
 
     def _get_embedding_kwargs(self, **kwargs):
         embedding_kwargs = {
@@ -96,6 +97,10 @@ class LiteLLMEmbeddingProvider(EmbeddingProvider):
                 input=texts,
                 **kwargs,
             )
+            if hasattr(response, 'usage') and response.usage:
+                u = response.usage
+                self._embedding_usage["prompt_tokens"] += (u.get('prompt_tokens', 0) if isinstance(u, dict) else getattr(u, 'prompt_tokens', 0)) or 0
+                self._embedding_usage["total_tokens"] += (u.get('total_tokens', 0) if isinstance(u, dict) else getattr(u, 'total_tokens', 0)) or 0
             return [data["embedding"] for data in response.data]
         except AuthenticationError:
             logger.error(
@@ -205,6 +210,12 @@ class LiteLLMEmbeddingProvider(EmbeddingProvider):
             "kwargs": kwargs,
         }
         return self._execute_with_backoff_sync(task)
+
+    def reset_embedding_usage(self):
+        self._embedding_usage = {"prompt_tokens": 0, "total_tokens": 0}
+
+    def get_embedding_usage(self) -> dict:
+        return dict(self._embedding_usage)
 
     def rerank(
         self,

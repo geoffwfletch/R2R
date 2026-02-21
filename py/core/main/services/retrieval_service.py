@@ -34,6 +34,7 @@ from core.base import (
     R2RException,
     SearchSettings,
     WebSearchResult,
+    expand_chunks_to_parents,
     format_search_results_for_llm,
 )
 from core.base.agent.tools.registry import ToolRegistry
@@ -1028,6 +1029,12 @@ class RetrievalService(Service):
                             web_results.web_search_results
                         )
             # 3) Build context from aggregator
+            if aggregated_results.chunk_search_results:
+                aggregated_results.chunk_search_results = (
+                    expand_chunks_to_parents(
+                        aggregated_results.chunk_search_results
+                    )
+                )
             collector = SearchResultsCollector()
             collector.add_aggregate_result(aggregated_results)
             context_str = format_search_results_for_llm(aggregated_results)

@@ -4,6 +4,7 @@ from .base_utils import (
     deep_update,
     dump_collector,
     dump_obj,
+    expand_chunks_to_parents,
     format_search_results_for_llm,
     generate_default_prompt_id,
     generate_default_user_collection_id,
@@ -19,6 +20,7 @@ from .splitter.text import RecursiveCharacterTextSplitter, TextSplitter
 
 __all__ = [
     "format_search_results_for_llm",
+    "expand_chunks_to_parents",
     # ID generation
     "generate_id",
     "generate_document_id",

@@ -26,6 +26,13 @@ from core.base.providers import (
 logger = logging.getLogger()
 
 
+def _get_usage_field(usage, field: str, default: int = 0) -> int:
+    """Extract a field from a usage object that may be a dict or pydantic model."""
+    if isinstance(usage, dict):
+        return usage.get(field, default) or default
+    return getattr(usage, field, default) or default
+
+
 _ROMAN_NUMERALS = frozenset({
     "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X",
     "XI", "XII", "XIII", "XIV", "XV", "XVI", "XVII", "XVIII", "XIX", "XX",
@@ -270,7 +277,12 @@ class VLMPDFParser(AsyncParser[str | bytes]):
         self.max_concurrent_vlm_tasks = (
             self.config.max_concurrent_vlm_tasks or 5
         )
+        self.vlm_pages_per_call = getattr(
+            self.config, "vlm_pages_per_call", None
+        ) or 1
         self.semaphore = None
+        self._vlm_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        self._chunk_selection_usage = {"prompt_tokens": 0, "completion_tokens": 0}
 
     @staticmethod
     def _clean_vlm_output(text: str) -> str:
@@ -297,11 +309,11 @@ class VLMPDFParser(AsyncParser[str | bytes]):
             # Convert image bytes to base64
             image_base64 = base64.b64encode(image_data).decode("utf-8")
 
-            model = self.config.app.vlm
+            model = getattr(self, '_vlm_override', None) or self.config.vlm or self.config.app.vlm
 
             # Configure generation parameters
             generation_config = GenerationConfig(
-                model=self.config.vlm or self.config.app.vlm,
+                model=model,
                 stream=False,
                 max_tokens_to_sample=self.vlm_max_tokens_to_sample,
             )
@@ -373,6 +385,10 @@ class VLMPDFParser(AsyncParser[str | bytes]):
                     tool_choice={"type": "tool", "name": "parse_pdf_page"},
                 )
 
+                if hasattr(response, 'usage') and response.usage:
+                    self._vlm_usage["prompt_tokens"] += _get_usage_field(response.usage, 'prompt_tokens')
+                    self._vlm_usage["completion_tokens"] += _get_usage_field(response.usage, 'completion_tokens')
+
                 if (
                     response.choices
                     and response.choices[0].message
@@ -398,6 +414,10 @@ class VLMPDFParser(AsyncParser[str | bytes]):
                     apply_timeout=True,
                 )
 
+                if hasattr(response, 'usage') and response.usage:
+                    self._vlm_usage["prompt_tokens"] += _get_usage_field(response.usage, 'prompt_tokens')
+                    self._vlm_usage["completion_tokens"] += _get_usage_field(response.usage, 'completion_tokens')
+
                 if response.choices and response.choices[0].message:
                     content = self._clean_vlm_output(
                         response.choices[0].message.content or ""
@@ -421,6 +441,117 @@ class VLMPDFParser(AsyncParser[str | bytes]):
                 "content": f"Error processing page: {str(e)}",
             }
 
+    async def process_pages(
+        self, images: list, page_nums: list[int]
+    ) -> list[dict[str, str]]:
+        """Process multiple PDF pages in a single VLM call."""
+        call_start = time.perf_counter()
+        n = len(images)
+        try:
+            image_blocks = []
+            model = getattr(self, '_vlm_override', None) or self.config.vlm or self.config.app.vlm
+            is_anthropic = model and "anthropic/" in model
+
+            for image in images:
+                img_byte_arr = BytesIO()
+                image.save(img_byte_arr, format="JPEG")
+                image_base64 = base64.b64encode(
+                    img_byte_arr.getvalue()
+                ).decode("utf-8")
+
+                if is_anthropic:
+                    image_blocks.append(
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": image_base64,
+                            },
+                        }
+                    )
+                else:
+                    image_blocks.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_base64}"
+                            },
+                        }
+                    )
+
+            prompt = (
+                f"{self.vision_prompt_text}\n\n"
+                f"You are given {n} consecutive pages "
+                f"(pages {page_nums[0]}-{page_nums[-1]}). "
+                f"Convert ALL pages. Separate each page with "
+                f"exactly this marker on its own line: "
+                f"<!--PAGE_BREAK-->"
+            )
+
+            content_blocks = [{"type": "text", "text": prompt}]
+            content_blocks.extend(image_blocks)
+            messages = [{"role": "user", "content": content_blocks}]
+
+            generation_config = GenerationConfig(
+                model=model,
+                stream=False,
+                max_tokens_to_sample=self.vlm_max_tokens_to_sample * n,
+            )
+
+            logger.debug(
+                f"Sending pages {page_nums[0]}-{page_nums[-1]} "
+                f"to vision model in single call."
+            )
+
+            response = await self.llm_provider.aget_completion(
+                messages=messages,
+                generation_config=generation_config,
+                apply_timeout=True,
+            )
+
+            if hasattr(response, 'usage') and response.usage:
+                self._vlm_usage["prompt_tokens"] += getattr(response.usage, 'prompt_tokens', 0) or 0
+                self._vlm_usage["completion_tokens"] += getattr(response.usage, 'completion_tokens', 0) or 0
+
+            if response.choices and response.choices[0].message:
+                full_text = response.choices[0].message.content or ""
+                parts = full_text.split("<!--PAGE_BREAK-->")
+                elapsed = time.perf_counter() - call_start
+                logger.debug(
+                    f"Processed pages {page_nums[0]}-{page_nums[-1]} "
+                    f"in {elapsed:.2f}s, got {len(parts)} parts."
+                )
+
+                results = []
+                for i, page_num in enumerate(page_nums):
+                    text = (
+                        self._clean_vlm_output(parts[i])
+                        if i < len(parts)
+                        else ""
+                    )
+                    results.append(
+                        {"page": str(page_num), "content": text}
+                    )
+                return results
+            else:
+                return [
+                    {"page": str(p), "content": ""}
+                    for p in page_nums
+                ]
+        except Exception as e:
+            logger.error(
+                f"Error processing pages {page_nums[0]}-{page_nums[-1]}: "
+                f"{e}"
+            )
+            return [
+                {
+                    "page": str(p),
+                    "content": f"Error processing page: {e}",
+                }
+                for p in page_nums
+            ]
+
     async def process_and_yield(self, image, page_num: int):
         """Process a page and yield the result."""
         async with self.semaphore:
@@ -429,6 +560,20 @@ class VLMPDFParser(AsyncParser[str | bytes]):
                 "content": result.get("content", "") or "",
                 "page_number": page_num,
             }
+
+    async def process_and_yield_multi(
+        self, images: list, page_nums: list[int]
+    ):
+        """Process multiple pages in one VLM call and yield results."""
+        async with self.semaphore:
+            results = await self.process_pages(images, page_nums)
+            return [
+                {
+                    "content": r.get("content", "") or "",
+                    "page_number": int(r["page"]),
+                }
+                for r in results
+            ]
 
     async def _llm_chunk_selection(
         self, full_md: str, chunk_model: str
@@ -481,6 +626,9 @@ class VLMPDFParser(AsyncParser[str | bytes]):
                     generation_config=generation_config,
                     apply_timeout=True,
                 )
+                if hasattr(response, 'usage') and response.usage:
+                    self._chunk_selection_usage["prompt_tokens"] += _get_usage_field(response.usage, 'prompt_tokens')
+                    self._chunk_selection_usage["completion_tokens"] += _get_usage_field(response.usage, 'completion_tokens')
                 if response.choices and response.choices[0].message:
                     result_text = response.choices[0].message.content or ""
                     raw_segments.append(result_text)
@@ -514,6 +662,17 @@ class VLMPDFParser(AsyncParser[str | bytes]):
         """Process PDF as images using pdf2image."""
         ingest_start = time.perf_counter()
         logger.info("Starting PDF ingestion using VLMPDFParser.")
+
+        self._vlm_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        self._chunk_selection_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+
+        # Per-request VLM model override (from frontend ingestion settings)
+        app_override = kwargs.get("app", {})
+        if isinstance(app_override, dict) and app_override.get("vlm"):
+            self._vlm_override = app_override["vlm"]
+            logger.info(f"Using per-request VLM override: {self._vlm_override}")
+        else:
+            self._vlm_override = None
 
         if not self.vision_prompt_text:
             self.vision_prompt_text = (
@@ -567,14 +726,34 @@ class VLMPDFParser(AsyncParser[str | bytes]):
                         last_page=batch_end,
                     )
 
-                # Create tasks for each page in the batch
-                for i, image in enumerate(images):
-                    page_num = batch_start + i
-                    task = asyncio.create_task(
-                        self.process_and_yield(image, page_num)
-                    )
-                    task.page_num = page_num  # Store page number for sorting
-                    pending_tasks.append(task)
+                # Create tasks — group pages per VLM call
+                ppc = kwargs.get(
+                    "vlm_pages_per_call", self.vlm_pages_per_call
+                )
+                if ppc > 1:
+                    for i in range(0, len(images), ppc):
+                        group_imgs = images[i : i + ppc]
+                        group_nums = [
+                            batch_start + i + j
+                            for j in range(len(group_imgs))
+                        ]
+                        task = asyncio.create_task(
+                            self.process_and_yield_multi(
+                                group_imgs, group_nums
+                            )
+                        )
+                        task.page_num = group_nums[0]
+                        task._is_multi = True
+                        pending_tasks.append(task)
+                else:
+                    for i, image in enumerate(images):
+                        page_num = batch_start + i
+                        task = asyncio.create_task(
+                            self.process_and_yield(image, page_num)
+                        )
+                        task.page_num = page_num
+                        task._is_multi = False
+                        pending_tasks.append(task)
 
                 # Check if any tasks have completed and yield them in order
                 while pending_tasks:
@@ -602,9 +781,15 @@ class VLMPDFParser(AsyncParser[str | bytes]):
                     ):
                         task = completed_tasks.pop(0)
                         result = await task
-                        all_page_contents.append(result)
-                        yield result
-                        next_page_to_yield += 1
+                        if isinstance(result, list):
+                            for r in result:
+                                all_page_contents.append(r)
+                                yield r
+                            next_page_to_yield += len(result)
+                        else:
+                            all_page_contents.append(result)
+                            yield result
+                            next_page_to_yield += 1
 
             # Wait for and yield any remaining tasks in order
             while pending_tasks:
@@ -622,9 +807,15 @@ class VLMPDFParser(AsyncParser[str | bytes]):
                 ):
                     task = completed_tasks.pop(0)
                     result = await task
-                    all_page_contents.append(result)
-                    yield result
-                    next_page_to_yield += 1
+                    if isinstance(result, list):
+                        for r in result:
+                            all_page_contents.append(r)
+                            yield r
+                        next_page_to_yield += len(result)
+                    else:
+                        all_page_contents.append(result)
+                        yield result
+                        next_page_to_yield += 1
 
             # Assemble full markdown preview from all pages
             if all_page_contents:
@@ -659,6 +850,21 @@ class VLMPDFParser(AsyncParser[str | bytes]):
                                 "metadata": {"chunk_order": i},
                                 "pre_chunked": True,
                             }
+
+            # Yield LLM usage signals for cost tracking
+            if self._vlm_usage["prompt_tokens"] > 0:
+                yield {
+                    "type": "llm_usage_vlm",
+                    "usage": dict(self._vlm_usage),
+                    "model": getattr(self, '_vlm_override', None) or self.config.vlm or self.config.app.vlm,
+                    "pages": max_pages,
+                }
+            if self._chunk_selection_usage["prompt_tokens"] > 0:
+                yield {
+                    "type": "llm_usage_chunk_selection",
+                    "usage": dict(self._chunk_selection_usage),
+                    "model": kwargs.get("llm_chunk_model", ""),
+                }
 
             total_elapsed = time.perf_counter() - ingest_start
             logger.info(

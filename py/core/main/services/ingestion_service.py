@@ -344,6 +344,14 @@ class IngestionService:
                 ),
             )
 
+            if hasattr(response, 'usage') and response.usage:
+                u = response.usage
+                document_info.metadata['llm_usage_summary'] = {
+                    'prompt_tokens': (u.get('prompt_tokens', 0) if isinstance(u, dict) else getattr(u, 'prompt_tokens', 0)) or 0,
+                    'completion_tokens': (u.get('completion_tokens', 0) if isinstance(u, dict) else getattr(u, 'completion_tokens', 0)) or 0,
+                    'model': self.config.ingestion.document_summary_model or self.config.app.fast_llm,
+                }
+
             document_info.summary = response.choices[0].message.content  # type: ignore
 
             if not document_info.summary:

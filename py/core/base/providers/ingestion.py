@@ -22,6 +22,7 @@ class ChunkingStrategy(str, Enum):
     MARKDOWN = "markdown"
     BASIC = "basic"
     BY_TITLE = "by_title"
+    MARKDOWN_PARENT_CHILD = "markdown_parent_child"
 
 
 class IngestionConfig(ProviderConfig):
@@ -39,7 +40,10 @@ class IngestionConfig(ProviderConfig):
         "vlm_batch_size": 5,
         "vlm_max_tokens_to_sample": 1_024,
         "max_concurrent_vlm_tasks": 5,
+        "vlm_pages_per_call": 1,
         "vlm_ocr_one_page_per_chunk": True,
+        "parent_word_limit": 1500,
+        "max_parent_chars": 0,
         "skip_document_summary": False,
         "document_summary_system_prompt": "system",
         "document_summary_task_prompt": "summary",
@@ -95,10 +99,21 @@ class IngestionConfig(ProviderConfig):
             "max_concurrent_vlm_tasks"
         ]
     )
+    vlm_pages_per_call: int = Field(
+        default_factory=lambda: IngestionConfig._defaults[
+            "vlm_pages_per_call"
+        ]
+    )
     vlm_ocr_one_page_per_chunk: bool = Field(
         default_factory=lambda: IngestionConfig._defaults[
             "vlm_ocr_one_page_per_chunk"
         ]
+    )
+    parent_word_limit: int = Field(
+        default_factory=lambda: IngestionConfig._defaults["parent_word_limit"]
+    )
+    max_parent_chars: int = Field(
+        default_factory=lambda: IngestionConfig._defaults["max_parent_chars"]
     )
     skip_document_summary: bool = Field(
         default_factory=lambda: IngestionConfig._defaults[

@@ -231,6 +231,18 @@ class R2RIngestionProvider(IngestionProvider):
             )
         elif chunking_strategy == ChunkingStrategy.BY_TITLE:
             raise NotImplementedError("By title method not implemented")
+        elif chunking_strategy == ChunkingStrategy.MARKDOWN_PARENT_CHILD:
+            from shared.utils.splitter.text import MarkdownParentChildChunker
+
+            return MarkdownParentChildChunker(
+                child_chunk_size=chunk_size,
+                parent_word_limit=ingestion_config_override.get(
+                    "parent_word_limit", self.config.parent_word_limit
+                ),
+                max_parent_chars=ingestion_config_override.get(
+                    "max_parent_chars", self.config.max_parent_chars
+                ),
+            )
         else:
             raise ValueError(f"Unsupported method type: {chunking_strategy}")
 
@@ -327,6 +339,23 @@ class R2RIngestionProvider(IngestionProvider):
                         )
                         continue
 
+                    # LLM usage signals for cost tracking
+                    if item.get("type") == "llm_usage_vlm":
+                        ingestion_config_override["_llm_usage_vlm"] = {
+                            "prompt_tokens": item["usage"]["prompt_tokens"],
+                            "completion_tokens": item["usage"]["completion_tokens"],
+                            "model": item.get("model", ""),
+                            "pages": item.get("pages", 0),
+                        }
+                        continue
+                    if item.get("type") == "llm_usage_chunk_selection":
+                        ingestion_config_override["_llm_usage_chunk_selection"] = {
+                            "prompt_tokens": item["usage"]["prompt_tokens"],
+                            "completion_tokens": item["usage"]["completion_tokens"],
+                            "model": item.get("model", ""),
+                        }
+                        continue
+
                     # Pre-chunked content (from HybridChunker)
                     if item.get("pre_chunked"):
                         pre_chunked_contents.append(item)
@@ -393,10 +422,6 @@ class R2RIngestionProvider(IngestionProvider):
                 contents
                 and override_name in ("zerox", "ocr")
             ):
-                vlm_ocr_one_page_per_chunk = ingestion_config_override.get(
-                    "vlm_ocr_one_page_per_chunk", True
-                )
-
                 sorted_contents = [
                     item
                     for item in sorted(
@@ -405,6 +430,63 @@ class R2RIngestionProvider(IngestionProvider):
                     )
                     if isinstance(item.get("content"), str)
                 ]
+
+                chunking_strategy_val = ingestion_config_override.get(
+                    "chunking_strategy", self.config.chunking_strategy
+                )
+
+                if (
+                    chunking_strategy_val
+                    == ChunkingStrategy.MARKDOWN_PARENT_CHILD
+                ):
+                    from shared.utils.splitter.text import (
+                        MarkdownParentChildChunker,
+                    )
+
+                    full_md = "\n\n".join(
+                        item["content"] for item in sorted_contents
+                    )
+                    chunker = MarkdownParentChildChunker(
+                        child_chunk_size=ingestion_config_override.get(
+                            "chunk_size", self.config.chunk_size
+                        ),
+                        parent_word_limit=ingestion_config_override.get(
+                            "parent_word_limit", self.config.parent_word_limit
+                        ),
+                        max_parent_chars=ingestion_config_override.get(
+                            "max_parent_chars", self.config.max_parent_chars
+                        ),
+                    )
+                    child_docs = chunker.create_documents(full_md)
+                    iteration = 0
+                    for child_doc in child_docs:
+                        metadata = {
+                            **document.metadata,
+                            **child_doc.metadata,
+                        }
+                        extraction = DocumentChunk(
+                            id=generate_extraction_id(
+                                document.id, iteration
+                            ),
+                            document_id=document.id,
+                            owner_id=document.owner_id,
+                            collection_ids=document.collection_ids,
+                            data=child_doc.page_content,
+                            metadata=metadata,
+                        )
+                        iteration += 1
+                        yield extraction
+                    logger.debug(
+                        f"Parsed document with id={document.id}, "
+                        f"into {iteration} extractions "
+                        f"in t={time.time() - t0:.2f} seconds "
+                        f"using markdown_parent_child."
+                    )
+                    return
+
+                vlm_ocr_one_page_per_chunk = ingestion_config_override.get(
+                    "vlm_ocr_one_page_per_chunk", True
+                )
 
                 if vlm_ocr_one_page_per_chunk:
                     iteration = 0
@@ -481,9 +563,59 @@ class R2RIngestionProvider(IngestionProvider):
             # Auto-select markdown chunking for docling_markdown override
             effective_override = dict(ingestion_config_override)
             if override_name == "docling_markdown":
-                effective_override.setdefault(
-                    "chunking_strategy", ChunkingStrategy.MARKDOWN
+                resolved = effective_override.get(
+                    "chunking_strategy"
+                ) or self.config.chunking_strategy
+                if resolved not in (
+                    ChunkingStrategy.MARKDOWN_PARENT_CHILD,
+                    ChunkingStrategy.MARKDOWN,
+                ):
+                    effective_override["chunking_strategy"] = (
+                        ChunkingStrategy.MARKDOWN
+                    )
+
+            # For MARKDOWN_PARENT_CHILD, assemble all pages then chunk holistically
+            resolved_strategy = effective_override.get(
+                "chunking_strategy"
+            ) or self.config.chunking_strategy
+            if resolved_strategy == ChunkingStrategy.MARKDOWN_PARENT_CHILD:
+                from shared.utils.splitter.text import MarkdownParentChildChunker
+
+                full_md = "\n\n".join(
+                    item["content"] for item in contents
                 )
+                chunker = MarkdownParentChildChunker(
+                    child_chunk_size=effective_override.get(
+                        "chunk_size", self.config.chunk_size
+                    ),
+                    parent_word_limit=effective_override.get(
+                        "parent_word_limit", self.config.parent_word_limit
+                    ),
+                    max_parent_chars=effective_override.get(
+                        "max_parent_chars", self.config.max_parent_chars
+                    ),
+                )
+                child_docs = chunker.create_documents(full_md)
+                iteration = 0
+                for child_doc in child_docs:
+                    metadata = {**document.metadata, **child_doc.metadata}
+                    extraction = DocumentChunk(
+                        id=generate_extraction_id(document.id, iteration),
+                        document_id=document.id,
+                        owner_id=document.owner_id,
+                        collection_ids=document.collection_ids,
+                        data=child_doc.page_content,
+                        metadata=metadata,
+                    )
+                    iteration += 1
+                    yield extraction
+                logger.debug(
+                    f"Parsed document with id={document.id}, "
+                    f"into {iteration} extractions "
+                    f"in t={time.time() - t0:.2f} seconds "
+                    f"using docling markdown_parent_child."
+                )
+                return
 
             iteration = 0
             for content_item in contents:

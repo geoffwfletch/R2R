@@ -47,6 +47,18 @@ base_model = "azure/text-embedding-3-large"
 base_dimension = 512
 
 [ingestion]
-chunk_size = 4096
-chunk_overlap = 512
-chunking_strategy = "markdown"
+chunking_strategy = "markdown_parent_child"
+chunk_size = 400
+chunk_overlap = 0
+vlm_ocr_one_page_per_chunk = false
+parent_word_limit = 1500
+max_parent_chars = 10000
+automatic_extraction = true
+excluded_parsers = []
+vlm_batch_size = 20
+max_concurrent_vlm_tasks = 20
+vlm_pages_per_call = 1
+
+  [ingestion.extra_parsers]
+    pdf = ["zerox", "ocr", "docling_markdown", "text"]
+    docx = ["docling_markdown", "text"]

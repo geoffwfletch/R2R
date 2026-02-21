@@ -2079,3 +2079,189 @@ class MarkdownChunker:
             )
 
         return merged
+
+
+class MarkdownParentChildChunker:
+    """OCR/VLM markdown parent-child chunker.
+
+    ## sections become parents; sections >parent_word_limit words use ### as parents.
+    Child chunks ≤child_chunk_size chars. Tables and fenced code blocks never split.
+    max_parent_chars: if >0, parent_content stored in metadata is capped at this length
+    (child embedding text is always the full child chunk regardless).
+    """
+
+    def __init__(
+        self,
+        child_chunk_size: int = 400,
+        parent_word_limit: int = 1500,
+        max_parent_chars: int = 0,
+    ) -> None:
+        self._child_chunk_size = child_chunk_size
+        self._parent_word_limit = parent_word_limit
+        self._max_parent_chars = max_parent_chars
+        self._child_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=child_chunk_size,
+            chunk_overlap=0,
+        )
+
+    def create_documents(
+        self, text: "str | list[str]"
+    ) -> list[SplitterDocument]:
+        if isinstance(text, list):
+            text = "\n\n".join(text)
+
+        parent_sections = self._extract_parent_sections(text)
+
+        all_children: list[SplitterDocument] = []
+        chunk_order = 0
+
+        for parent_key, breadcrumb, parent_content in parent_sections:
+            llm_content = self._cap_parent(parent_content)
+            cleaned, replacements = self._extract_atomic_blocks(parent_content)
+            child_docs = self._child_splitter.create_documents([cleaned])
+
+            for child_doc in child_docs:
+                restored = self._restore_atomic_blocks(
+                    child_doc.page_content, replacements
+                )
+                if not restored.strip():
+                    continue
+                all_children.append(
+                    SplitterDocument(
+                        page_content=restored,
+                        metadata={
+                            "breadcrumb": breadcrumb,
+                            "parent_key": parent_key,
+                            "parent_content": llm_content,
+                            "chunk_order": chunk_order,
+                        },
+                    )
+                )
+                chunk_order += 1
+
+        return all_children
+
+    def _cap_parent(self, text: str) -> str:
+        """Truncate parent_content at max_parent_chars word boundary (0 = no cap)."""
+        if not self._max_parent_chars or len(text) <= self._max_parent_chars:
+            return text
+        truncated = text[: self._max_parent_chars]
+        last_space = truncated.rfind(" ")
+        if last_space > self._max_parent_chars // 2:
+            truncated = truncated[:last_space]
+        return truncated + "\n\n[… truncated]"
+
+    def _extract_parent_sections(
+        self, text: str
+    ) -> list[tuple[str, str, str]]:
+        """Parse markdown into (parent_key, breadcrumb, content) tuples."""
+        h12_re = re.compile(r"^(#{1,2})\s+(.+)$", re.MULTILINE)
+        matches = list(h12_re.finditer(text))
+
+        if not matches:
+            return [("__root__", "", text.strip())]
+
+        sections: list[tuple[str, str, str]] = []
+
+        # Capture preamble before the first header
+        preamble = text[: matches[0].start()].strip()
+        if preamble:
+            sections.append(("__preamble__", "", preamble))
+
+        h1_current = ""
+
+        for idx, m in enumerate(matches):
+            level = len(m.group(1))
+            title = m.group(2).strip()
+            start = m.start()
+            end = (
+                matches[idx + 1].start()
+                if idx + 1 < len(matches)
+                else len(text)
+            )
+            section_text = text[start:end].rstrip()
+
+            if level == 1:
+                h1_current = title
+                # Capture any content between this h1 and the next header
+                # (text that isn't under any ## subsection)
+                newline_pos = section_text.find("\n")
+                body = section_text[newline_pos + 1 :].strip() if newline_pos != -1 else ""
+                if body:
+                    sections.append((title, title, section_text))
+            elif level == 2:
+                h2_key = f"{h1_current}__{title}" if h1_current else title
+                breadcrumb = (
+                    f"{h1_current} > {title}" if h1_current else title
+                )
+
+                if self._count_words(section_text) > self._parent_word_limit:
+                    h3_re = re.compile(r"^###\s+(.+)$", re.MULTILINE)
+                    h3_matches = list(h3_re.finditer(section_text))
+                    if h3_matches:
+                        for h3_idx, h3_m in enumerate(h3_matches):
+                            h3_start = h3_m.start()
+                            h3_end = (
+                                h3_matches[h3_idx + 1].start()
+                                if h3_idx + 1 < len(h3_matches)
+                                else len(section_text)
+                            )
+                            h3_title = h3_m.group(1).strip()
+                            h3_content = section_text[h3_start:h3_end].rstrip()
+                            h3_key = f"{h2_key}__{h3_title}"
+                            h3_breadcrumb = f"{breadcrumb} > {h3_title}"
+                            sections.append((h3_key, h3_breadcrumb, h3_content))
+                        continue
+
+                sections.append((h2_key, breadcrumb, section_text))
+
+        if not sections:
+            return [("__root__", "", text.strip())]
+
+        return sections
+
+    def _extract_atomic_blocks(
+        self, text: str
+    ) -> tuple[str, dict[str, str]]:
+        replacements: dict[str, str] = {}
+        counter = 0
+
+        def replace_block(m: re.Match) -> str:
+            nonlocal counter
+            counter += 1
+            ph = f"__ATOMIC_{counter}__"
+            replacements[ph] = m.group(0)
+            return f"\n{ph}\n"
+
+        # Fenced code blocks first (may contain table-like content)
+        text = re.sub(r"```[\s\S]*?```", replace_block, text)
+        # Tables: consecutive lines starting with |
+        text = re.sub(
+            r"(?:^[ \t]*\|[^\n]*\n?)+",
+            replace_block,
+            text,
+            flags=re.MULTILINE,
+        )
+        return text, replacements
+
+    @staticmethod
+    def _restore_atomic_blocks(text: str, replacements: dict[str, str]) -> str:
+        for ph, original in replacements.items():
+            text = text.replace(ph, original)
+        return text.strip()
+
+    @staticmethod
+    def _build_breadcrumb(meta: dict) -> str:
+        parts = [meta.get("h1"), meta.get("h2"), meta.get("h3")]
+        return " > ".join(p for p in parts if p)
+
+    @staticmethod
+    def _build_parent_key(meta: dict) -> str:
+        parts = [meta.get("h1"), meta.get("h2")]
+        if meta.get("h3"):
+            parts.append(meta["h3"])
+        return "__".join(p for p in parts if p)
+
+    @staticmethod
+    def _count_words(text: str) -> int:
+        return len(text.split())
