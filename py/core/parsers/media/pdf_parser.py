@@ -286,7 +286,7 @@ class VLMPDFParser(AsyncParser[str | bytes]):
 
     @staticmethod
     def _clean_vlm_output(text: str) -> str:
-        """Strip code fences and metadata lines from VLM output."""
+        """Strip code fences, metadata lines, and graph blocks from VLM output."""
         # Remove ```markdown ... ``` wrapping
         text = re.sub(r"^```(?:markdown)?\s*\n?", "", text.strip())
         text = re.sub(r"\n?```\s*$", "", text.strip())
@@ -297,7 +297,40 @@ class VLMPDFParser(AsyncParser[str | bytes]):
             text,
             flags=re.MULTILINE,
         )
+        # Remove graph extraction blocks
+        text = re.sub(
+            r"<!--GRAPH_START-->.*?<!--GRAPH_END-->",
+            "",
+            text,
+            flags=re.DOTALL,
+        )
         return text.strip()
+
+    @staticmethod
+    def _parse_graph_from_vlm(text: str, page_num: int = 0) -> tuple[str, dict | None]:
+        """Split VLM response into clean markdown and graph data dict."""
+        start_marker = "<!--GRAPH_START-->"
+        end_marker = "<!--GRAPH_END-->"
+        start_idx = text.find(start_marker)
+        if start_idx == -1:
+            return text, None
+        end_idx = text.find(end_marker, start_idx)
+        if end_idx == -1:
+            return text[:start_idx].strip(), None
+        clean_text = text[:start_idx].strip()
+        graph_json = text[start_idx + len(start_marker):end_idx].strip()
+        try:
+            data = json.loads(graph_json)
+            entities = data.get("entities", [])
+            relationships = data.get("relationships", [])
+            for e in entities:
+                e["page_number"] = page_num
+            for r in relationships:
+                r["page_number"] = page_num
+            return clean_text, {"entities": entities, "relationships": relationships}
+        except json.JSONDecodeError:
+            logger.warning(f"Failed to parse graph JSON from VLM on page {page_num}")
+            return clean_text, None
 
     async def process_page(self, image, page_num: int) -> dict[str, str]:
         """Process a single PDF page using the vision model."""
@@ -358,6 +391,45 @@ class VLMPDFParser(AsyncParser[str | bytes]):
             logger.debug(f"Sending page {page_num} to vision model.")
 
             if is_anthropic:
+                tool_properties = {
+                    "page_content": {
+                        "type": "string",
+                        "description": "Extracted text from the PDF page, transcribed into markdown",
+                    },
+                    "thoughts": {
+                        "type": "string",
+                        "description": "Any thoughts or comments on the text",
+                    },
+                }
+                if getattr(self, '_do_graph_extraction', False):
+                    tool_properties["entities"] = {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "type": {"type": "string"},
+                                "description": {"type": "string"},
+                            },
+                            "required": ["name", "type"],
+                        },
+                        "description": "Entities extracted from this page",
+                    }
+                    tool_properties["relationships"] = {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "subject": {"type": "string"},
+                                "predicate": {"type": "string"},
+                                "object": {"type": "string"},
+                                "description": {"type": "string"},
+                            },
+                            "required": ["subject", "predicate", "object"],
+                        },
+                        "description": "Relationships between entities on this page",
+                    }
+
                 response = await self.llm_provider.aget_completion(
                     messages=messages,
                     generation_config=generation_config,
@@ -368,16 +440,7 @@ class VLMPDFParser(AsyncParser[str | bytes]):
                             "description": "Parse text content from a PDF page",
                             "input_schema": {
                                 "type": "object",
-                                "properties": {
-                                    "page_content": {
-                                        "type": "string",
-                                        "description": "Extracted text from the PDF page, transcribed into markdown",
-                                    },
-                                    "thoughts": {
-                                        "type": "string",
-                                        "description": "Any thoughts or comments on the text",
-                                    },
-                                },
+                                "properties": tool_properties,
                                 "required": ["page_content"],
                             },
                         }
@@ -397,16 +460,26 @@ class VLMPDFParser(AsyncParser[str | bytes]):
                     tool_call = response.choices[0].message.tool_calls[0]
                     args = json.loads(tool_call.function.arguments)
                     content = self._clean_vlm_output(args.get("page_content", ""))
+                    graph_data = None
+                    if getattr(self, '_do_graph_extraction', False):
+                        entities = args.get("entities", [])
+                        relationships = args.get("relationships", [])
+                        for e in entities:
+                            e["page_number"] = page_num
+                        for r in relationships:
+                            r["page_number"] = page_num
+                        if entities or relationships:
+                            graph_data = {"entities": entities, "relationships": relationships}
                     page_elapsed = time.perf_counter() - page_start
                     logger.debug(
                         f"Processed page {page_num} in {page_elapsed:.2f} seconds."
                     )
-                    return {"page": str(page_num), "content": content}
+                    return {"page": str(page_num), "content": content, "graph_data": graph_data}
                 else:
                     logger.warning(
                         f"No valid tool call in response for page {page_num}, document might be missing text."
                     )
-                    return {"page": str(page_num), "content": ""}
+                    return {"page": str(page_num), "content": "", "graph_data": None}
             else:
                 response = await self.llm_provider.aget_completion(
                     messages=messages,
@@ -419,26 +492,28 @@ class VLMPDFParser(AsyncParser[str | bytes]):
                     self._vlm_usage["completion_tokens"] += _get_usage_field(response.usage, 'completion_tokens')
 
                 if response.choices and response.choices[0].message:
-                    content = self._clean_vlm_output(
-                        response.choices[0].message.content or ""
-                    )
+                    raw_text = response.choices[0].message.content or ""
+                    graph_data = None
+                    if getattr(self, '_do_graph_extraction', False):
+                        raw_text, graph_data = self._parse_graph_from_vlm(raw_text, page_num)
+                    content = self._clean_vlm_output(raw_text)
                     page_elapsed = time.perf_counter() - page_start
                     logger.debug(
                         f"Processed page {page_num} in {page_elapsed:.2f} seconds."
                     )
-                    return {"page": str(page_num), "content": content}
+                    return {"page": str(page_num), "content": content, "graph_data": graph_data}
                 else:
                     msg = f"No response content for page {page_num}"
                     logger.error(msg)
-                    return {"page": str(page_num), "content": ""}
+                    return {"page": str(page_num), "content": "", "graph_data": None}
         except Exception as e:
             logger.error(
                 f"Error processing page {page_num} with vision model: {str(e)}"
             )
-            # Return empty content rather than raising to avoid failing the entire batch
             return {
                 "page": str(page_num),
                 "content": f"Error processing page: {str(e)}",
+                "graph_data": None,
             }
 
     async def process_pages(
@@ -525,18 +600,18 @@ class VLMPDFParser(AsyncParser[str | bytes]):
 
                 results = []
                 for i, page_num in enumerate(page_nums):
-                    text = (
-                        self._clean_vlm_output(parts[i])
-                        if i < len(parts)
-                        else ""
-                    )
+                    raw_text = parts[i] if i < len(parts) else ""
+                    graph_data = None
+                    if getattr(self, '_do_graph_extraction', False) and raw_text:
+                        raw_text, graph_data = self._parse_graph_from_vlm(raw_text, page_num)
+                    text = self._clean_vlm_output(raw_text) if raw_text else ""
                     results.append(
-                        {"page": str(page_num), "content": text}
+                        {"page": str(page_num), "content": text, "graph_data": graph_data}
                     )
                 return results
             else:
                 return [
-                    {"page": str(p), "content": ""}
+                    {"page": str(p), "content": "", "graph_data": None}
                     for p in page_nums
                 ]
         except Exception as e:
@@ -548,6 +623,7 @@ class VLMPDFParser(AsyncParser[str | bytes]):
                 {
                     "page": str(p),
                     "content": f"Error processing page: {e}",
+                    "graph_data": None,
                 }
                 for p in page_nums
             ]
@@ -559,6 +635,7 @@ class VLMPDFParser(AsyncParser[str | bytes]):
             return {
                 "content": result.get("content", "") or "",
                 "page_number": page_num,
+                "graph_data": result.get("graph_data"),
             }
 
     async def process_and_yield_multi(
@@ -571,6 +648,7 @@ class VLMPDFParser(AsyncParser[str | bytes]):
                 {
                     "content": r.get("content", "") or "",
                     "page_number": int(r["page"]),
+                    "graph_data": r.get("graph_data"),
                 }
                 for r in results
             ]
@@ -674,13 +752,40 @@ class VLMPDFParser(AsyncParser[str | bytes]):
         else:
             self._vlm_override = None
 
-        if not self.vision_prompt_text:
-            self.vision_prompt_text = (
-                await self.database_provider.prompts_handler.get_cached_prompt(
-                    prompt_name="vision_pdf"
-                )
+        # Load and format vision prompt with graph extraction instructions
+        entity_types = kwargs.get("entity_types", [])
+        self._do_graph_extraction = bool(entity_types)
+
+        raw_prompt = (
+            await self.database_provider.prompts_handler.get_cached_prompt(
+                prompt_name="vision_pdf"
             )
-            logger.info("Retrieved vision prompt text from database.")
+        )
+
+        if self._do_graph_extraction:
+            type_str = ", ".join(entity_types)
+            graph_instructions = (
+                f"Knowledge Graph Extraction:\n"
+                f"Also extract entities and relationships from this page.\n"
+                f"Focus on these entity types: {type_str}.\n"
+                f"For each entity provide name, type, and a brief description.\n"
+                f"For each relationship provide subject, predicate, object, and description.\n\n"
+                f"Output graph data after the markdown in this exact format:\n"
+                f"<!--GRAPH_START-->\n"
+                f'{{"entities": [{{"name": "...", "type": "...", "description": "..."}}], '
+                f'"relationships": [{{"subject": "...", "predicate": "...", "object": "...", "description": "..."}}]}}\n'
+                f"<!--GRAPH_END-->\n"
+                f"If no entities found, output empty arrays in the graph block."
+            )
+        else:
+            graph_instructions = ""
+
+        self.vision_prompt_text = raw_prompt.replace(
+            "{graph_extraction_instructions}", graph_instructions
+        )
+        logger.info(
+            f"Vision prompt loaded (graph_extraction={'on' if self._do_graph_extraction else 'off'})."
+        )
 
         self.semaphore = asyncio.Semaphore(self.max_concurrent_vlm_tasks)
 
@@ -698,6 +803,8 @@ class VLMPDFParser(AsyncParser[str | bytes]):
             pending_tasks = []
             completed_tasks = []
             all_page_contents = []
+            all_graph_entities = []
+            all_graph_relationships = []
             next_page_to_yield = 1
 
             # Process pages with a sliding window, in batches
@@ -783,10 +890,18 @@ class VLMPDFParser(AsyncParser[str | bytes]):
                         result = await task
                         if isinstance(result, list):
                             for r in result:
+                                gd = r.pop("graph_data", None)
+                                if gd:
+                                    all_graph_entities.extend(gd.get("entities", []))
+                                    all_graph_relationships.extend(gd.get("relationships", []))
                                 all_page_contents.append(r)
                                 yield r
                             next_page_to_yield += len(result)
                         else:
+                            gd = result.pop("graph_data", None)
+                            if gd:
+                                all_graph_entities.extend(gd.get("entities", []))
+                                all_graph_relationships.extend(gd.get("relationships", []))
                             all_page_contents.append(result)
                             yield result
                             next_page_to_yield += 1
@@ -809,10 +924,18 @@ class VLMPDFParser(AsyncParser[str | bytes]):
                     result = await task
                     if isinstance(result, list):
                         for r in result:
+                            gd = r.pop("graph_data", None)
+                            if gd:
+                                all_graph_entities.extend(gd.get("entities", []))
+                                all_graph_relationships.extend(gd.get("relationships", []))
                             all_page_contents.append(r)
                             yield r
                         next_page_to_yield += len(result)
                     else:
+                        gd = result.pop("graph_data", None)
+                        if gd:
+                            all_graph_entities.extend(gd.get("entities", []))
+                            all_graph_relationships.extend(gd.get("relationships", []))
                         all_page_contents.append(result)
                         yield result
                         next_page_to_yield += 1
@@ -864,6 +987,18 @@ class VLMPDFParser(AsyncParser[str | bytes]):
                     "type": "llm_usage_chunk_selection",
                     "usage": dict(self._chunk_selection_usage),
                     "model": kwargs.get("llm_chunk_model", ""),
+                }
+
+            # Yield inline graph data signal
+            if all_graph_entities or all_graph_relationships:
+                logger.info(
+                    f"VLM inline graph extraction: {len(all_graph_entities)} entities, "
+                    f"{len(all_graph_relationships)} relationships"
+                )
+                yield {
+                    "type": "graph_data",
+                    "entities": all_graph_entities,
+                    "relationships": all_graph_relationships,
                 }
 
             total_elapsed = time.perf_counter() - ingest_start

@@ -16,10 +16,77 @@ from core.utils import (
     num_tokens,
     update_settings_from_dict,
 )
+from shared.abstractions.graph import StoreType
 
 from ...services import IngestionService
 
 logger = logging.getLogger()
+
+
+async def _store_inline_graph_data(service, document_info, graph_data):
+    """Store inline-extracted graph data from VLM into document entity/relationship tables."""
+    import json as _json
+    entities = graph_data.get("entities", [])
+    relationships = graph_data.get("relationships", [])
+    if not entities and not relationships:
+        return
+
+    logger.info(
+        f"Storing inline graph: {len(entities)} entities, "
+        f"{len(relationships)} relationships for doc {document_info.id}"
+    )
+
+    conn = service.providers.database.connection_manager
+    project = service.providers.database.project_name
+    entity_table = f'"{project}"."documents_entities"'
+    rel_table = f'"{project}"."documents_relationships"'
+
+    # Deduplicate entities by name (keep first occurrence)
+    seen_names = set()
+    unique_entities = []
+    for e in entities:
+        if e["name"] not in seen_names:
+            seen_names.add(e["name"])
+            unique_entities.append(e)
+
+    entity_name_to_id = {}
+    for entity in unique_entities:
+        try:
+            meta = _json.dumps({"page_number": entity.get("page_number"), "source": "vlm_inline"})
+            row = await conn.fetchrow_query(
+                f"""INSERT INTO {entity_table} (name, category, description, parent_id, metadata)
+                    VALUES ($1, $2, $3, $4, $5::jsonb) RETURNING id""",
+                [entity["name"], entity.get("type"), entity.get("description"),
+                 document_info.id, meta],
+            )
+            entity_name_to_id[entity["name"]] = row["id"]
+        except Exception as e:
+            logger.warning(f"Failed to create entity '{entity.get('name')}': {e}")
+
+    for rel in relationships:
+        subject_id = entity_name_to_id.get(rel.get("subject"))
+        object_id = entity_name_to_id.get(rel.get("object"))
+        if not subject_id or not object_id:
+            continue
+        try:
+            meta = _json.dumps({"page_number": rel.get("page_number"), "source": "vlm_inline"})
+            await conn.fetchrow_query(
+                f"""INSERT INTO {rel_table}
+                    (subject, subject_id, predicate, object, object_id, parent_id, description, metadata, weight)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)""",
+                [rel.get("subject"), subject_id, rel.get("predicate"), rel.get("object"),
+                 object_id, document_info.id, rel.get("description"), meta, 1.0],
+            )
+        except Exception as e:
+            logger.warning(f"Failed to create relationship: {e}")
+
+    logger.info(f"Stored {len(entity_name_to_id)} entities, checking relationships...")
+
+    await service.providers.database.documents_handler.set_workflow_status(
+        id=document_info.id,
+        status_type="extraction_status",
+        status="success",
+    )
 
 
 def simple_ingestion_factory(service: IngestionService):
@@ -70,6 +137,9 @@ def simple_ingestion_factory(service: IngestionService):
                 document_info.metadata['llm_usage_vlm'] = ingestion_config.pop('_llm_usage_vlm')
             if ingestion_config.get('_llm_usage_chunk_selection'):
                 document_info.metadata['llm_usage_chunk_selection'] = ingestion_config.pop('_llm_usage_chunk_selection')
+
+            # Collect inline graph data (store after finalize to avoid status overwrite)
+            graph_data = ingestion_config.pop('_graph_data', None)
 
             if not ingestion_config.get("skip_document_summary", False):
                 await service.update_document_status(
@@ -203,6 +273,10 @@ def simple_ingestion_factory(service: IngestionService):
                 logger.warning(
                     "Automatic extraction not yet implemented for `simple` ingestion workflows."
                 )
+
+            # Store inline graph data AFTER all status updates to avoid overwrite
+            if graph_data:
+                await _store_inline_graph_data(service, document_info, graph_data)
 
         except AuthenticationError as e:
             if document_info is not None:

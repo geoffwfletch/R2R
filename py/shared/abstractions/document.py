@@ -333,6 +333,10 @@ class IngestionConfig(R2RSerializable):
     chunks_for_document_summary: int = 128
     document_summary_model: str = ""
 
+    # Inline graph extraction during VLM OCR
+    entity_types: list[str] = []
+    relation_types: list[str] = []
+
     @property
     def supported_providers(self) -> list[str]:
         return ["r2r", "unstructured_local", "unstructured_api"]

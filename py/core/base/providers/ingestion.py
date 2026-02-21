@@ -53,6 +53,8 @@ class IngestionConfig(ProviderConfig):
         "parser_overrides": {},
         "extra_fields": {},
         "automatic_extraction": False,
+        "entity_types": [],
+        "relation_types": [],
     }
 
     provider: str = Field(
@@ -153,6 +155,10 @@ class IngestionConfig(ProviderConfig):
             "document_summary_max_length"
         ]
     )
+
+    # Inline graph extraction during VLM OCR
+    entity_types: list[str] = Field(default_factory=list)
+    relation_types: list[str] = Field(default_factory=list)
 
     @classmethod
     def set_default(cls, **kwargs):

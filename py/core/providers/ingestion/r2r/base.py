@@ -356,6 +356,14 @@ class R2RIngestionProvider(IngestionProvider):
                         }
                         continue
 
+                    # Inline graph data from VLM extraction
+                    if item.get("type") == "graph_data":
+                        ingestion_config_override["_graph_data"] = {
+                            "entities": item["entities"],
+                            "relationships": item["relationships"],
+                        }
+                        continue
+
                     # Pre-chunked content (from HybridChunker)
                     if item.get("pre_chunked"):
                         pre_chunked_contents.append(item)

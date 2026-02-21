@@ -25,5 +25,7 @@ vision_pdf:
     - Do NOT output "Page number:", "Header/Footer:", "Sidebars/Callouts:" or any metadata about page elements
     - Do NOT wrap output in code fences
     - Only output the actual document content as markdown
+
+    {graph_extraction_instructions}
   overwrite_on_diff: true
   input_types: {}
