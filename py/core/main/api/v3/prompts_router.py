@@ -1,7 +1,11 @@
 import logging
 import textwrap
+from datetime import datetime, timezone
+from pathlib import Path as FilePath
 from typing import Optional
+from uuid import UUID
 
+import yaml
 from fastapi import Body, Depends, Path, Query
 
 from core.base import R2RException
@@ -13,6 +17,8 @@ from core.base.api.models import (
     WrappedPromptResponse,
     WrappedPromptsResponse,
 )
+
+PROMPTS_DEFAULTS_DIR = FilePath(__file__).resolve().parents[3] / "providers" / "database" / "prompts_defaults"
 
 from ...abstractions import R2RProviders, R2RServices
 from ...config import R2RConfig
@@ -170,6 +176,62 @@ class PromptsRouter(BaseRouterV3):
                     "total_entries": get_prompts_response["total_entries"],
                 },
             )
+
+        @self.router.get(
+            "/prompts/defaults",
+            dependencies=[Depends(self.rate_limit_dependency)],
+            summary="List all default prompts from YAML backups",
+        )
+        @self.base_endpoint
+        async def get_prompt_defaults(
+            auth_user=Depends(self.providers.auth.auth_wrapper()),
+        ) -> WrappedPromptsResponse:
+            """Return original default prompts read from YAML backup files."""
+            if not auth_user.is_superuser:
+                raise R2RException("Only a superuser can list prompt defaults.", 403)
+            results = []
+            epoch = datetime(2000, 1, 1, tzinfo=timezone.utc)
+            nil_uuid = UUID(int=0)
+            if PROMPTS_DEFAULTS_DIR.is_dir():
+                for yaml_file in sorted(PROMPTS_DEFAULTS_DIR.glob("*.yaml")):
+                    with open(yaml_file, "r") as f:
+                        data = yaml.safe_load(f) or {}
+                    for prompt_name, prompt_data in data.items():
+                        results.append({
+                            "id": nil_uuid,
+                            "name": prompt_name,
+                            "template": prompt_data.get("template", ""),
+                            "input_types": prompt_data.get("input_types", {}),
+                            "created_at": epoch,
+                            "updated_at": epoch,
+                        })
+            return results, {"total_entries": len(results)}  # type: ignore
+
+        @self.router.post(
+            "/prompts/{name}/reset",
+            dependencies=[Depends(self.rate_limit_dependency)],
+            summary="Reset a prompt to its YAML default",
+        )
+        @self.base_endpoint
+        async def reset_prompt_to_default(
+            name: str = Path(..., description="Prompt name"),
+            auth_user=Depends(self.providers.auth.auth_wrapper()),
+        ) -> WrappedGenericMessageResponse:
+            """Reset a prompt to its original YAML default."""
+            if not auth_user.is_superuser:
+                raise R2RException("Only a superuser can reset prompts.", 403)
+            yaml_file = PROMPTS_DEFAULTS_DIR / f"{name}.yaml"
+            if not yaml_file.exists():
+                raise R2RException(f"No default YAML found for prompt '{name}'.", 404)
+            with open(yaml_file, "r") as f:
+                data = yaml.safe_load(f) or {}
+            if name not in data:
+                raise R2RException(f"Prompt '{name}' not found in YAML file.", 404)
+            prompt_data = data[name]
+            template = prompt_data.get("template", "")
+            input_types = prompt_data.get("input_types", {})
+            result = await self.services.management.update_prompt(name, template, input_types)
+            return GenericMessageResponse(message=result)  # type: ignore
 
         @self.router.post(
             "/prompts/{name}",

@@ -123,8 +123,8 @@ max_parent_chars = 10000  # hard cap on parent_content sent to LLM (0 = no cap)
     n_chunks = 2 # the number of chunks (both preceding and succeeding) to use in enrichment
 
   [ingestion.extra_parsers]
-    pdf = ["zerox", "ocr", "docling_markdown", "text"]
-    docx = ["docling_markdown", "text"]
+    pdf = ["zerox", "ocr", "text"]
+    docx = ["text"]
 
 [ocr]
 provider = "mistral"

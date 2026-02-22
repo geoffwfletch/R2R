@@ -60,5 +60,5 @@ max_concurrent_vlm_tasks = 20
 vlm_pages_per_call = 1
 
   [ingestion.extra_parsers]
-    pdf = ["zerox", "ocr", "docling_markdown", "text"]
-    docx = ["docling_markdown", "text"]
+    pdf = ["zerox", "ocr", "text"]
+    docx = ["text"]

@@ -41,7 +41,7 @@ class R2RIngestionProvider(IngestionProvider):
         DocumentType.BMP: parsers.BMPParser,
         DocumentType.CSV: parsers.CSVParser,
         DocumentType.DOC: parsers.DOCParser,
-        DocumentType.DOCX: parsers.DoclingHybridDOCXParser,
+        DocumentType.DOCX: parsers.DOCXParser,
         DocumentType.EML: parsers.EMLParser,
         DocumentType.EPUB: parsers.EPUBParser,
         DocumentType.HTML: parsers.HTMLParser,
@@ -51,7 +51,7 @@ class R2RIngestionProvider(IngestionProvider):
         DocumentType.MSG: parsers.MSGParser,
         DocumentType.ORG: parsers.ORGParser,
         DocumentType.MD: parsers.MDParser,
-        DocumentType.PDF: parsers.DoclingHybridPDFParser,
+        DocumentType.PDF: parsers.BasicPDFParser,
         DocumentType.PPT: parsers.PPTParser,
         DocumentType.PPTX: parsers.PPTXParser,
         DocumentType.TXT: parsers.TextParser,
@@ -81,11 +81,9 @@ class R2RIngestionProvider(IngestionProvider):
             "ocr": parsers.OCRPDFParser,
             "unstructured": parsers.PDFParserUnstructured,
             "zerox": parsers.VLMPDFParser,
-            "docling_markdown": parsers.DoclingMarkdownPDFParser,
             "text": parsers.BasicPDFParser,
         },
         DocumentType.DOCX: {
-            "docling_markdown": parsers.DoclingMarkdownDOCXParser,
             "text": parsers.DOCXParser,
         },
         DocumentType.XLSX: {"advanced": parsers.XLSXParserAdvanced},
@@ -293,7 +291,6 @@ class R2RIngestionProvider(IngestionProvider):
         else:
             t0 = time.time()
             contents = []
-            pre_chunked_contents = []
             markdown_preview = None
             chunked_markdown_preview = None
 
@@ -364,11 +361,6 @@ class R2RIngestionProvider(IngestionProvider):
                         }
                         continue
 
-                    # Pre-chunked content (from HybridChunker)
-                    if item.get("pre_chunked"):
-                        pre_chunked_contents.append(item)
-                        continue
-
                     # Dict with content (OCR/VLM page-based)
                     if item.get("content"):
                         contents.append(item)
@@ -393,37 +385,6 @@ class R2RIngestionProvider(IngestionProvider):
                 ingestion_config_override[
                     "_chunked_markdown_preview"
                 ] = chunked_markdown_preview
-
-            # Handle pre-chunked output (docling_hybrid)
-            if pre_chunked_contents:
-                iteration = 0
-                for item in pre_chunked_contents:
-                    chunk_meta = item.get("metadata", {})
-                    metadata = {
-                        **document.metadata,
-                        "chunk_order": chunk_meta.get(
-                            "chunk_order", iteration
-                        ),
-                    }
-
-                    extraction = DocumentChunk(
-                        id=generate_extraction_id(document.id, iteration),
-                        document_id=document.id,
-                        owner_id=document.owner_id,
-                        collection_ids=document.collection_ids,
-                        data=item["content"],
-                        metadata=metadata,
-                    )
-                    iteration += 1
-                    yield extraction
-
-                logger.debug(
-                    f"Parsed document with id={document.id}, "
-                    f"title={document.metadata.get('title', None)}, "
-                    f"into {iteration} pre-chunked extractions "
-                    f"in t={time.time() - t0:.2f} seconds."
-                )
-                return
 
             # Handle OCR/VLM page-based output with one-page-per-chunk option
             if (
@@ -568,19 +529,7 @@ class R2RIngestionProvider(IngestionProvider):
                 )
                 return
 
-            # Auto-select markdown chunking for docling_markdown override
             effective_override = dict(ingestion_config_override)
-            if override_name == "docling_markdown":
-                resolved = effective_override.get(
-                    "chunking_strategy"
-                ) or self.config.chunking_strategy
-                if resolved not in (
-                    ChunkingStrategy.MARKDOWN_PARENT_CHILD,
-                    ChunkingStrategy.MARKDOWN,
-                ):
-                    effective_override["chunking_strategy"] = (
-                        ChunkingStrategy.MARKDOWN
-                    )
 
             # For MARKDOWN_PARENT_CHILD, assemble all pages then chunk holistically
             resolved_strategy = effective_override.get(
@@ -621,7 +570,7 @@ class R2RIngestionProvider(IngestionProvider):
                     f"Parsed document with id={document.id}, "
                     f"into {iteration} extractions "
                     f"in t={time.time() - t0:.2f} seconds "
-                    f"using docling markdown_parent_child."
+                    f"using markdown_parent_child."
                 )
                 return
 

@@ -1,0 +1,31 @@
+vision_pdf:
+  template: >
+    Convert this PDF page to markdown. Output ONLY the markdown content directly — no code fences, no ```markdown blocks, no metadata.
+
+    Text:
+    - Maintain heading hierarchy (# ## ###), paragraphs, lists
+    - Preserve bold, italic formatting
+    - Include footnotes, citations, references
+    - Keep original reading order
+
+    Tables:
+    - Use markdown table syntax
+    - Preserve all headers, rows, columns
+    - Include table captions if present
+
+    Equations:
+    - Use LaTeX notation
+    - Preserve equation numbers
+
+    Images:
+    - Describe images within [FIG] and [/FIG] tags
+    - Include subject matter, text overlays, chart/graph descriptions
+
+    Rules:
+    - Do NOT output "Page number:", "Header/Footer:", "Sidebars/Callouts:" or any metadata about page elements
+    - Do NOT wrap output in code fences
+    - Only output the actual document content as markdown
+
+    {graph_extraction_instructions}
+  overwrite_on_diff: true
+  input_types: {}

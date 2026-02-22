@@ -1400,7 +1400,7 @@ class DocumentsRouter(BaseRouterV3):
             """Returns the markdown preview of a document if available.
 
             Markdown previews are generated during ingestion for documents
-            processed with docling-based parsers.
+            processed with VLM-based parsers.
             """
             try:
                 document_uuid = UUID(id)

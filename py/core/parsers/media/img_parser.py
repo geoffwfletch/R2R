@@ -5,7 +5,10 @@ from io import BytesIO
 from typing import AsyncGenerator, Optional
 
 import filetype
-import pillow_heif
+try:
+    import pyheif
+except ImportError:
+    pyheif = None  # type: ignore[assignment]
 from PIL import Image
 
 from core.base.abstractions import GenerationConfig
@@ -44,8 +47,7 @@ class ImageParser(AsyncParser[str | bytes]):
         self.config = config
         self.vision_prompt_text = None
         self.Image = Image
-        self.pillow_heif = pillow_heif
-        self.pillow_heif.register_heif_opener()
+        self.pyheif = pyheif
 
     def _is_heic(self, data: bytes) -> bool:
         """Detect HEIC format using magic numbers and patterns."""
@@ -71,27 +73,20 @@ class ImageParser(AsyncParser[str | bytes]):
     async def _convert_heic_to_jpeg(self, data: bytes) -> bytes:
         """Convert HEIC image to JPEG format."""
         try:
-            # Create BytesIO object for input
-            input_buffer = BytesIO(data)
-
-            # Load HEIC image using pillow_heif
-            heif_file = self.pillow_heif.read_heif(input_buffer)
-
-            # Get the primary image - API changed, need to get first image
-            heif_image = heif_file[0]  # Get first image in the container
-
-            # Convert to PIL Image directly from the HEIF image
-            pil_image = heif_image.to_pillow()
-
-            # Convert to RGB if needed
+            heif_file = self.pyheif.read(data)
+            pil_image = Image.frombytes(
+                heif_file.mode,
+                heif_file.size,
+                heif_file.data,
+                "raw",
+                heif_file.mode,
+                heif_file.stride,
+            )
             if pil_image.mode != "RGB":
                 pil_image = pil_image.convert("RGB")
-
-            # Save as JPEG
             output_buffer = BytesIO()
             pil_image.save(output_buffer, format="JPEG", quality=95)
             return output_buffer.getvalue()
-
         except Exception as e:
             logger.error(f"Error converting HEIC to JPEG: {str(e)}")
             raise
