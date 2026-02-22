@@ -8,4 +8,4 @@ if ($proc) {
 
 Write-Host "Starting R2R server..."
 Set-Location "$PSScriptRoot\py"
-& ".\.venv\Scripts\python.exe" -m r2r.serve
+& ".\.venv\Scripts\python.exe" -m r2r.serve --config-name r2r_charlo
